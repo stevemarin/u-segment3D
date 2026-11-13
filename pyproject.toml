@@ -34,7 +34,7 @@ classifiers = [
 
 requires-python = ">=3.9, <3.13"
 dependencies = [
-    'numpy<2.0',   
+    'numpy<2.0',
     'pyarrow<21',
     'cellpose<4.0',
     'cupy-cuda12x; sys_platform!="darwin"',
@@ -56,7 +56,7 @@ dependencies = [
     'tqdm',
     'scikit-fmm; sys_platform=="win"',
     'czifile'
-    ]
+]
 
 [project.urls]
 Homepage = "https://github.com/DanuserLab/u-segment3D"

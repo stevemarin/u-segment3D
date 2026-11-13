@@ -18,10 +18,10 @@ import time
 import cc3d
 import multiprocess as mp
 import numpy as np
-import scipy.ndimage as ndimage
 import skimage.measure as skmeasure
 import skimage.segmentation as sksegmentation
 from multiprocess.pool import ThreadPool
+from scipy import ndimage
 from scipy.interpolate import RegularGridInterpolator
 from tiler import Tiler
 from tqdm import tqdm
