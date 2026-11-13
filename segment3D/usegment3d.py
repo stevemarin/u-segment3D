@@ -3,21 +3,72 @@
 Created on Mon Feb 20 22:35:23 2023
 
 @author: fyz11
+
+High-level u-Segment3D pipeline:
+
+1. ``preprocess_imgs``: rescale, illumination-correct and normalize the volume.
+2. ``Cellpose2D_model_auto``: run Cellpose slice-by-slice in one view (xy, xz or yz).
+3. ``aggregate_2D_to_3D_segmentation_direct_method`` / ``..._indirect_method``:
+   fuse the 2D views into one 3D foreground and one 3D gradient field, then
+   group voxels into cells by gradient descent.
+4. ``postprocess_3D_cell_segmentation``, ``label_diffuse_3D_cell_segmentation_MP``,
+   ``guided_filter_3D_cell_segmentation_MP``: optional clean-up and refinement.
 """
+
+import gc
+import os
+
+import multiprocess as mp
+import numpy as np
+import scipy.io as spio
+import scipy.ndimage as ndimage
+import skimage.filters as skfilters
+import skimage.measure as skmeasure
+import skimage.morphology as skmorph
+
+from segment3D import file_io as usegment3D_fio
 from segment3D import filters as usegment3D_filters
+from segment3D import flows as usegment3D_flows
 from segment3D import gpu as usegment3D_gpu
 from segment3D import segmentation as usegment3D_segment
 from segment3D import watershed as usegment3D_watershed
-from segment3D import flows as usegment3D_flows
-from segment3D import file_io as usegment3D_fio
 
-import scipy.ndimage as ndimage 
-import numpy as np 
-import os 
+# For each view (0: xy, 1: xz, 2: yz), a 2D gradient has 2 channels. After prepending a
+# zero channel, this index order puts the channels into (dz, dy, dx) order.
+_VIEW_GRADIENT_CHANNEL_ORDER = ([0, 1, 2], [1, 0, 2], [1, 2, 0])
+
+# Axis order that maps a view's (2, N, A, B) gradient stack back to (2, Z, Y, X).
+_VIEW_TO_ZYX_AXES = ((0, 1, 2, 3), (0, 2, 1, 3), (0, 2, 3, 1))
+
+
+# =============================================================================
+# 1. Preprocessing
+# =============================================================================
+def _rescale_channels(rescale_fn, imgs, zoom, **kwargs):
+    """Median-fill zero pixels and rescale each channel."""
+    return np.array(
+        [
+            rescale_fn(usegment3D_filters.fill_array(img, method="median"), zoom, **kwargs)
+            for img in imgs
+        ],
+        dtype=np.float32,
+    )
+
+
+def _normalize_channels(imgs, pmin, pmax, bg_fn=None, **bg_kwargs):
+    """Optionally background-correct each channel with bg_fn, then percentile-normalize."""
+    return np.array(
+        [
+            usegment3D_gpu.num_normalize(
+                img if bg_fn is None else bg_fn(img, **bg_kwargs), pmin=pmin, pmax=pmax, clip=True
+            )
+            for img in imgs
+        ]
+    )
 
 
 def preprocess_imgs(img, params):
-    r""" wrapper function for running preprocessing steps. 
+    r"""wrapper function for running preprocessing steps.
 
     Parameters
     ----------
@@ -30,85 +81,86 @@ def preprocess_imgs(img, params):
     -------
     imgs_out : numpy array
         (M,N,L) grayscale 3D volume image or (C,M,N,L) multichannel 3D volumes where C=# of channels. preprocessing will be applied to each channel separately. If do_img_avg == True in the parameters, channels will be averaged to return a single (M,N,L) volume image
-    
+
     """
-    
     # check dimensions
     img_dim = len(img.shape)
-    
+
     if img_dim > 3:
         imgs_out = img.copy()
     elif img_dim == 3:
         imgs_out = [img]
     else:
-        print('error: Image must be a grayscale volume image of 3 spatial dimensions, or be 4D array where the first dimension, is the number of images or channels.')
-        
-    
-    # 1. resize and fill in gaps with median 
-    zoom = [params['factor'] * p for p in params['voxel_res']]
-    
+        print(
+            "error: Image must be a grayscale volume image of 3 spatial dimensions, or be 4D array where the first dimension, is the number of images or channels."
+        )
+
+    # 1. resize and fill in gaps with median. Try CUDA, then torch, then CPU.
+    zoom = [params["factor"] * p for p in params["voxel_res"]]
+
     try:
-        imgs_out = np.array([usegment3D_gpu.dask_cuda_rescale(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom, order=1, mode='reflect') for ch in np.arange(len(imgs_out))], dtype=np.float32)
+        imgs_out = _rescale_channels(
+            usegment3D_gpu.dask_cuda_rescale, imgs_out, zoom, order=1, mode="reflect"
+        )
     except Exception as e:
         try:
-            print('no CUDA. trying torch for resizing', '| error:', repr(e))
-            imgs_out = np.array([usegment3D_gpu.zoom_3d_pytorch(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom) for ch in np.arange(len(imgs_out))], dtype=np.float32)
+            print("no CUDA. trying torch for resizing", "| error:", repr(e))
+            imgs_out = _rescale_channels(usegment3D_gpu.zoom_3d_pytorch, imgs_out, zoom)
         except Exception as e:
-            print('no gpu. falling back to CPU for resizing', '| error:', repr(e))
-            # imgs_out = np.array([ndimage.zoom(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom, order=1, mode='reflect') for ch in np.arange(len(imgs_out))], dtype=np.float32)
-            imgs_out = np.array([usegment3D_gpu.dask_cpu_rescale(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom, order=1, mode='reflect') for ch in np.arange(len(imgs_out))], dtype=np.float32)
+            print("no gpu. falling back to CPU for resizing", "| error:", repr(e))
+            imgs_out = _rescale_channels(
+                usegment3D_gpu.dask_cpu_rescale, imgs_out, zoom, order=1, mode="reflect"
+            )
 
-    # 2. background correct illumination 
-    bg_ds = params['bg_ds']
-    bg_sigma = params['bg_sigma']
-    bg_normalize_min = params['normalize_min']
-    bg_normalize_max = params['normalize_max']
-    do_bg_correct = params['do_bg_correction']
-    
-    if do_bg_correct:
+    # 2. background correct illumination, then normalize intensities.
+    pmin = params["normalize_min"]
+    pmax = params["normalize_max"]
+    bg_kwargs = {"bg_ds": params["bg_ds"], "bg_sigma": params["bg_sigma"]}
+
+    if params["do_bg_correction"]:
         try:
-            # gpu.bg_normalize uses cucim which somehow needs module load cuda. # so does cupy give this error hm... 
-            imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.bg_normalize(ch_im, bg_ds=bg_ds, bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
-            # imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.dask_cuda_bg(ch_im, 
-            #                                                                               bg_ds=bg_ds, 
-            #                                                                               bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
+            # gpu.bg_normalize uses cucim which somehow needs module load cuda.
+            imgs_out = _normalize_channels(
+                imgs_out, pmin, pmax, bg_fn=usegment3D_gpu.bg_normalize, **bg_kwargs
+            )
         except Exception as e:
             try:
-                print('no CUDA. trying torch for normalizing', '| error:', repr(e)) 
-                imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.bg_normalize_torch(ch_im, bg_ds=bg_ds, bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
+                print("no CUDA. trying torch for normalizing", "| error:", repr(e))
+                imgs_out = _normalize_channels(
+                    imgs_out, pmin, pmax, bg_fn=usegment3D_gpu.bg_normalize_torch, **bg_kwargs
+                )
             except Exception as e:
-                print('no gpu. falling back to CPU for normalizing', '| error:', repr(e))
-                imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.bg_normalize_cpu(ch_im, bg_ds=bg_ds, bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
+                print("no gpu. falling back to CPU for normalizing", "| error:", repr(e))
+                imgs_out = _normalize_channels(
+                    imgs_out, pmin, pmax, bg_fn=usegment3D_gpu.bg_normalize_cpu, **bg_kwargs
+                )
     else:
         try:
-            # gpu.bg_normalize uses cucim which somehow needs module load cuda. # so does cupy give this error hm... 
-            imgs_out = np.array([usegment3D_gpu.num_normalize(ch_im, pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
-            # imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.dask_cuda_bg(ch_im, 
-            #                                                                               bg_ds=bg_ds, 
-            #                                                                               bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
+            imgs_out = _normalize_channels(imgs_out, pmin, pmax)
         except Exception as e:
-            print('no gpu. falling back to CPU for normalizing', '| error:', repr(e))
-            imgs_out = np.array([usegment3D_gpu.num_normalize(ch_im, pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
-   
-        
+            print("no gpu. falling back to CPU for normalizing", "| error:", repr(e))
+            imgs_out = _normalize_channels(imgs_out, pmin, pmax)
+
     # 3. combine channels if needed.
-    if params['do_avg_imgs']: 
-        avg_func = params['avg_func_imgs']
+    if params["do_avg_imgs"]:
+        avg_func = params["avg_func_imgs"]
         imgs_out = avg_func(imgs_out, axis=0)
-        
+
     return imgs_out
-        
-        
+
+
+# =============================================================================
+# 2. Cellpose 2D segmentation of one view
+# =============================================================================
 def Cellpose2D_model_auto(img, view, params, basename=None, savefolder=None):
-    
-    r""" wrapper function for running Cellpose2D with diameter autotuning. 
+    r"""wrapper function for running Cellpose2D with diameter autotuning.
 
     Parameters
     ----------
     img : numpy array
         (M,N,L) grayscale 3D volume image or (C,M,N,L) multichannel 3D volumes where C=# of channels. This image should be provided in the same order as the input i.e. NO TRANSPOSE needed
     view : one of 'xy', 'xz', or 'yz'
-        specifies the view. 
+        specifies the view.
     params : Python dict
         Dictionary of parameters as specified by segment3D.parameters.get_preprocess_params
 
@@ -116,1260 +168,952 @@ def Cellpose2D_model_auto(img, view, params, basename=None, savefolder=None):
     -------
     auto_diam : Python dict
         (diam_range, diam_score, best_diam, test_slice
-    all_probs : numpy array 
-    
-    all_flows : numpy array 
-    
-    all_styles : numpy array 
-
+    all_probs : numpy array
+        Cellpose cell probability (logits), transposed back to the input (Z,Y,X) orientation.
+    all_flows : numpy array
+        Cellpose 2D flows, shape (2,Z,Y,X), transposed back to the input orientation.
+    all_styles : numpy array
+        Cellpose style vectors, one per slice.
 
     """
-    from cellpose import models
-    import scipy.io as spio 
     import cellpose
-    
-    if int(cellpose.version.split('.')[0])<4:
-        model = models.Cellpose(model_type=params['cellpose_modelname'], gpu=params['gpu'])
+    from cellpose import models
+
+    if int(cellpose.version.split(".")[0]) < 4:
+        model = models.Cellpose(model_type=params["cellpose_modelname"], gpu=params["gpu"])
     else:
-        model = models.CellposeModel(pretrained_model=params['cellpose_modelname'], gpu=params['gpu'])
-    
-    grayscale_bool = params['cellpose_channels'] =='grayscale'
+        model = models.CellposeModel(
+            pretrained_model=params["cellpose_modelname"], gpu=params["gpu"]
+        )
+
+    grayscale_bool = params["cellpose_channels"] == "grayscale"
     if grayscale_bool:
-        channels = [0,0]
+        channels = [0, 0]
     else:
-        channels = [2,1] # cytoplasm = 'Green' and nuclei='Red' channel.
-    
-    
-    if view == 'xy':
-        order = (0,1,2,3)
-    elif view == 'xz':
-        order = (1,0,2,3)
-    elif view == 'yz':
-        order = (2,0,1,3)
+        channels = [2, 1]  # cytoplasm = 'Green' and nuclei='Red' channel.
+
+    # bring the requested view's slicing axis to the front.
+    if view == "xy":
+        order = (0, 1, 2, 3)
+    elif view == "xz":
+        order = (1, 0, 2, 3)
+    elif view == "yz":
+        order = (2, 0, 1, 3)
     else:
-        print('error: view parameter must be one of the strings, \'xy\', \'xz\', or \'yz\' ') 
-        
+        print("error: view parameter must be one of the strings, 'xy', 'xz', or 'yz' ")
+
     if grayscale_bool:
-        input_im = img.transpose(order)[...,0]
+        input_im = img.transpose(order)[..., 0]
     else:
         input_im = img.transpose(order)
-    
-    auto_diam, (all_probs, all_flows, all_styles) = usegment3D_segment.apply_cellpose_model_2D_prob(input_im, 
-                                                                                                    model, 
-                                                                                                    model_channels=channels, 
-                                                                                                    best_diam=params['best_diam'], 
-                                                                                                    use_Cellpose_auto_diameter=params['use_Cellpose_auto_diameter'],
-                                                                                                    model_invert=params['model_invert'], 
-                                                                                                    test_slice=params['test_slice'], 
-                                                                                                    hist_norm=params['hist_norm'], # was True
-                                                                                                    diam_range=params['diam_range'], 
-                                                                                                    ksize=params['ksize'],
-                                                                                                    smoothwinsize=params['smoothwinsize'],
-                                                                                                    kernel_size=params['histnorm_kernel_size'], 
-                                                                                                    clip_limit=params['histnorm_clip_limit'],
-                                                                                                    use_edge=params['use_edge'],
-                                                                                                    show_img_bounds = params['show_img_bounds'],
-                                                                                                    saveplotsfolder=params['saveplotsfolder'],
-                                                                                                    use_prob_weighted_score=params['use_prob_weighted_score'],
-                                                                                                    debug_viz=params['debug_viz']) 
+
+    auto_diam, (all_probs, all_flows, all_styles) = usegment3D_segment.apply_cellpose_model_2D_prob(
+        input_im,
+        model,
+        model_channels=channels,
+        best_diam=params["best_diam"],
+        use_Cellpose_auto_diameter=params["use_Cellpose_auto_diameter"],
+        model_invert=params["model_invert"],
+        test_slice=params["test_slice"],
+        hist_norm=params["hist_norm"],
+        diam_range=params["diam_range"],
+        ksize=params["ksize"],
+        smoothwinsize=params["smoothwinsize"],
+        kernel_size=params["histnorm_kernel_size"],
+        clip_limit=params["histnorm_clip_limit"],
+        use_edge=params["use_edge"],
+        show_img_bounds=params["show_img_bounds"],
+        saveplotsfolder=params["saveplotsfolder"],
+        use_prob_weighted_score=params["use_prob_weighted_score"],
+        debug_viz=params["debug_viz"],
+    )
 
     all_probs = np.squeeze(all_probs).astype(np.float32)
-    all_flows = np.squeeze(all_flows).astype(np.float32) 
-            
-    all_flows = all_flows.transpose(1,0,2,3)
-    
-    if view == 'xy':
-        all_flows = all_flows.transpose(0,1,2,3)
-        
-    if view == 'xz':
-        all_probs = all_probs.transpose(1,0,2)
-        all_flows = all_flows.transpose(0,2,1,3) # the first channel is the flow!.
-        
-    if view == 'yz':
-        all_probs = all_probs.transpose(1,2,0)
-        all_flows = all_flows.transpose(0,2,3,1) # the first channel is the flow!.
-        
-        
+    all_flows = np.squeeze(all_flows).astype(np.float32)
+
+    # (N, 2, A, B) -> (2, N, A, B), then transpose the view back to (Z, Y, X).
+    all_flows = all_flows.transpose(1, 0, 2, 3)
+
+    if view == "xz":
+        all_probs = all_probs.transpose(1, 0, 2)
+        all_flows = all_flows.transpose(0, 2, 1, 3)
+    if view == "yz":
+        all_probs = all_probs.transpose(1, 2, 0)
+        all_flows = all_flows.transpose(0, 2, 3, 1)
+
     if (savefolder is not None) and (basename is not None):
-        
-        usegment3D_fio.write_pickle(os.path.join(savefolder, 
-                                  basename+'_cellpose_flows_%s.pkl' %(str(view))), 
-                                  {'flow': all_flows.astype(np.float32)})
-        usegment3D_fio.write_pickle(os.path.join(savefolder, 
-                                  basename+'_cellpose_probs_%s.pkl' %(str(view))), 
-                                  {'prob': all_probs.astype(np.float32)})
-        # write_pickle(os.path.join(savefolder, 
-        #                           basename+'_cellpose_masks_%s.pkl' %(str(view))), 
-        #                           {'mask': all_masks})
-        spio.savemat(os.path.join(savefolder, 
-                                  basename+'_cellpose_diam-styles_%s.mat' %(str(view))), 
-                      {#'diam' : all_diams,
-                      'style': all_styles,
-                      'diam_range':auto_diam, 
-                      'diam_score':auto_diam[1], 
-                      'best_diam':auto_diam[2]}, do_compression=True)
-        
+        usegment3D_fio.write_pickle(
+            os.path.join(savefolder, basename + "_cellpose_flows_%s.pkl" % (str(view))),
+            {"flow": all_flows.astype(np.float32)},
+        )
+        usegment3D_fio.write_pickle(
+            os.path.join(savefolder, basename + "_cellpose_probs_%s.pkl" % (str(view))),
+            {"prob": all_probs.astype(np.float32)},
+        )
+        spio.savemat(
+            os.path.join(savefolder, basename + "_cellpose_diam-styles_%s.mat" % (str(view))),
+            {
+                "style": all_styles,
+                "diam_range": auto_diam,
+                "diam_score": auto_diam[1],
+                "best_diam": auto_diam[2],
+            },
+            do_compression=True,
+        )
+
     return auto_diam, all_probs, all_flows, all_styles
 
 
-# make the equivalent below but for the indirect method which is more convoluted. 
-def aggregate_2D_to_3D_segmentation_direct_method(probs, gradients, params,
-                                                  precombined_binary = None, # this is to allow for using externally computed / combined versions. 
-                                                  precombined_gradients = None,
-                                                  savefolder=None,
-                                                  basename=None):
-    
-    import numpy as np 
-    import scipy.ndimage as ndimage
-    import skimage.filters as skfilters
-    import skimage.morphology as skmorph
-    import os 
-    
-    assert(len(probs) == 3)
-    assert(len(gradients) == 3)
-    
+# =============================================================================
+# 3. Shared steps of the 2D-to-3D aggregation (direct and indirect methods)
+# =============================================================================
+def _threshold_combined_probability(mask_combine, params):
+    """Binarize the combined 3D probability with the manual or automatic (multi-Otsu) threshold."""
+    prob_params = params["combine_cell_probs"]
+
+    if prob_params["prob_thresh"] is not None:
+        return mask_combine >= prob_params["prob_thresh"]
+
+    prob_thresh_raw = skfilters.threshold_multiotsu(
+        mask_combine, prob_params["threshold_n_levels"]
+    )[prob_params["threshold_level"]]
+
+    # additive offset on the automatic threshold (continuous in the Otsu value, unlike the legacy 1 d.p. floor).
+    prob_thresh_offset = prob_params.get("prob_thresh_offset", 0.0)
+    prob_thresh = prob_thresh_raw + prob_thresh_offset
+
+    if prob_params["apply_one_d_p_thresh"] > 0:
+        # legacy: floor to 1 decimal point.
+        prob_thresh = int(prob_thresh * 10) / 10.0
+
+    # enforce a minimum since statistically we can be skewed ...
+    prob_thresh = np.maximum(prob_params["min_prob_thresh"], prob_thresh)
+    print(
+        "Automatic binary thresholding: ",
+        prob_thresh,
+        "(multi-Otsu: %.4f, offset: %s, 1 d.p. floor: %s)"
+        % (prob_thresh_raw, prob_thresh_offset, bool(prob_params["apply_one_d_p_thresh"])),
+    )
+
+    return mask_combine >= prob_thresh
+
+
+def _postprocess_binary(mask_binary, params):
+    """Morphological clean-up of the thresholded 3D foreground."""
+    post = params["postprocess_binary"]
+
+    if post["binary_closing"] > 0:
+        mask_binary = skmorph.binary_closing(mask_binary, skmorph.ball(post["binary_closing"]))
+    if post["remove_small_objects"] > 0:
+        mask_binary = skmorph.remove_small_objects(
+            mask_binary, min_size=post["remove_small_objects"], connectivity=2
+        )
+    if post["binary_dilation"] > 0:
+        mask_binary = skmorph.binary_dilation(mask_binary, skmorph.ball(post["binary_dilation"]))
+    if post["binary_fill_holes"] > 0:
+        mask_binary = ndimage.binary_fill_holes(mask_binary)
+    if post["extra_erode"] > 0:
+        mask_binary = skmorph.binary_erosion(mask_binary, skmorph.ball(post["extra_erode"]))
+
+    return mask_binary
+
+
+def _binarize_combined_probability(mask_combine, params):
+    """Threshold then clean up the combined 3D probability."""
+    return _postprocess_binary(_threshold_combined_probability(mask_combine, params), params)
+
+
+def _view_gradient_to_zyx(gradient, view_index, shape):
+    """Turn a view's 2-channel gradient (already in Z,Y,X orientation) into 3 channels (dz,dy,dx).
+
+    The axis the view does not see gets a zero channel.
     """
-    First derive the binary, if this is not presupplied.
+    gradient = np.concatenate([np.zeros(shape, dtype=np.float32)[None, ...], gradient], axis=0)
+    return gradient[_VIEW_GRADIENT_CHANNEL_ORDER[view_index], ...].copy()
+
+
+def _fuse_two_views(first, second, gradient_params, shape, paired_sigma=None):
+    """Fuse one gradient component seen by two views. Either view may be missing (None).
+
+    Each view is Gaussian smoothed then combined with an inverse local-variance weighting.
+    ``paired_sigma`` overrides the smoothing sigma when both views are present.
     """
-    
+    sigma = gradient_params["smooth_sigma"]
+    if paired_sigma is None:
+        paired_sigma = sigma
+
+    if first is not None and second is not None:
+        return usegment3D_filters.var_combine(
+            [
+                ndimage.gaussian_filter(first, sigma=paired_sigma),
+                ndimage.gaussian_filter(second, sigma=paired_sigma),
+            ],
+            ksize=gradient_params["ksize"],
+            alpha=gradient_params["alpha"],
+        )
+    if second is not None:
+        return ndimage.gaussian_filter(second, sigma=sigma)
+    if first is not None:
+        return ndimage.gaussian_filter(first, sigma=sigma)
+    return np.zeros(shape, dtype=np.float32)
+
+
+def _smooth_stack_and_normalize(dz, dy, dx):
+    """Smooth each component, stack as (3,Z,Y,X) and normalize to unit vectors."""
+    dx = ndimage.gaussian_filter(dx, sigma=1.0)
+    dy = ndimage.gaussian_filter(dy, sigma=1.0)
+    dz = ndimage.gaussian_filter(dz, sigma=1.0)
+    gradients = np.concatenate([dz[None, ...], dy[None, ...], dx[None, ...]], axis=0)
+    return gradients / (np.linalg.norm(gradients, axis=0)[None, ...] + 1e-20)
+
+
+def _combine_view_gradients(view_gradients, params, shape):
+    """Fuse the (dz,dy,dx) gradients of the xy, xz and yz views into one 3D unit-vector field.
+
+    view_gradients : list of 3 arrays of shape (3,Z,Y,X), or [] for a missing view.
+    Returns (Z,Y,X,3) float32, the layout expected by the gradient descent.
+    """
+    xy, xz, yz = [g if len(g) > 0 else None for g in view_gradients]
+
+    def component(gradient, channel):
+        return None if gradient is None else gradient[channel]
+
+    gradient_params = params["combine_cell_gradients"]
+    dx = _fuse_two_views(component(xy, 2), component(xz, 2), gradient_params, shape)
+    dy = _fuse_two_views(component(xy, 1), component(yz, 1), gradient_params, shape)
+    # note: dz uses a fixed sigma of 1 (not smooth_sigma) when both views are present.
+    dz = _fuse_two_views(component(xz, 0), component(yz, 0), gradient_params, shape, paired_sigma=1)
+
+    labels_gradients = _smooth_stack_and_normalize(dz, dy, dx)
+    return labels_gradients.transpose(1, 2, 3, 0).astype(np.float32)
+
+
+def _save_combined_outputs(savefolder, basename, mask_binary, labels_gradients, mask_combine):
+    if (savefolder is not None) and (basename is not None):
+        usegment3D_fio.write_pickle(
+            os.path.join(savefolder, basename + "_combined2D_3D_probs_gradients_outputs.pkl"),
+            {"binary": mask_binary, "flow": labels_gradients, "prob": mask_combine},
+        )
+
+
+def _save_aggregated_segmentation(savefolder, basename, labels_3D):
+    if (savefolder is not None) and (basename is not None):
+        # note: both the direct and indirect methods save under this '_direct_method' name.
+        usegment3D_fio.save_segmentation(
+            os.path.join(
+                savefolder, basename + "_2D-to-3D_aggregated_u-Segment3D_direct_method.tif"
+            ),
+            labels_3D,
+        )
+
+
+def _gradient_descent_segment(mask_binary, labels_gradients, params):
+    """Group foreground voxels into cells by following the 3D gradients (serial or tiled MP)."""
+    gd = params["gradient_descent"]
+    cc = params["connected_component"]
+
+    common_kwargs = {
+        "gradient_img": labels_gradients,
+        "momenta": gd["momenta"],
+        "divergence_rescale": False,
+        "smooth_sigma": cc["smooth_sigma"],  # use a larger value for weird shapes.
+        "smooth_gradient": 1.0,  # this has no effect unless divergence_rescale=True
+        "delta": gd["delta"],
+        "n_iter": gd["n_iter"],
+        "gradient_decay": gd["gradient_decay"],
+        "interp": gd["interp"],
+        "binary_mask_gradient": gd["binary_mask_gradient"],
+        "eps": gd["eps"],
+        "min_area": cc["min_area"],
+        "thresh_factor": cc["thresh_factor"],
+        "mask": None,
+        "use_connectivity": gd["use_connectivity"],
+        "connectivity_alpha": gd["connectivity_alpha"],
+        "renorm_gradient": gd["renorm_gradient"],
+    }
+
+    if gd["do_mp"]:
+        labels_3D = usegment3D_watershed.mp_gradient_watershed3D_binary(
+            mask_binary > 0,
+            tile_shape=gd["tile_shape"],
+            tile_aspect=gd["tile_aspect"],
+            tile_overlap_ratio=gd["tile_overlap_ratio"],
+            debug_viz=False,  # can't visualize.
+            **common_kwargs,
+        )[0]
+    else:
+        labels_3D = usegment3D_watershed.gradient_watershed3D_binary(
+            mask_binary > 0,
+            debug_viz=gd["debug_viz"],
+            sampling=gd["sampling"],
+            track_percent=gd["track_percent"],
+            rand_seed=gd["rand_seed"],
+            ref_initial_color_img=gd["ref_initial_color_img"],
+            ref_alpha=gd["ref_alpha"],
+            saveplotsfolder=gd["saveplotsfolder"],
+            viewinit=gd["viewinit"],
+            **common_kwargs,
+        )[0]
+
+    return labels_3D
+
+
+def _unknown_probability(shape):
+    """Placeholder probability (all NaN) used when a precomputed binary is supplied."""
+    mask_combine = np.zeros(shape, dtype=np.float32)
+    mask_combine[:] = np.nan
+    return mask_combine
+
+
+# =============================================================================
+# 3a. Direct method: Cellpose probabilities + gradients as input
+# =============================================================================
+def aggregate_2D_to_3D_segmentation_direct_method(
+    probs,
+    gradients,
+    params,
+    precombined_binary=None,  # this is to allow for using externally computed / combined versions.
+    precombined_gradients=None,
+    savefolder=None,
+    basename=None,
+):
+    r"""Aggregate per-view 2D cell probabilities and gradients into a 3D instance segmentation.
+
+    Parameters
+    ----------
+    probs : list of 3
+        (Z,Y,X) cell probability logits for the xy, xz and yz views ([] for a missing view).
+    gradients : list of 3
+        (2,Z,Y,X) 2D gradients for the xy, xz and yz views ([] for a missing view).
+    params : dict
+        as given by segment3D.parameters.get_2D_to_3D_aggregation_params
+    precombined_binary : (Z,Y,X) array, optional
+        use this foreground instead of combining ``probs``.
+    precombined_gradients : (3,Z,Y,X) or (Z,Y,X,3) array, optional
+        use these 3D gradients instead of combining ``gradients``.
+
+    Returns
+    -------
+    labels_3D : (Z,Y,X) integer array
+    (mask_combine, labels_gradients) : the combined probability and the (Z,Y,X,3) gradients.
+    """
+    assert len(probs) == 3
+    assert len(gradients) == 3
+
+    # 1. combine the per-view probabilities into a 3D foreground.
     if precombined_binary is None:
-        
-        masks = list(probs) # split this. 
-        
-        # clip the 
-        masks = [np.clip(mask, -88.72, 88.72) for mask in masks if len(mask)>0]
-        
-        prob_mask = params['combine_cell_probs']['cellpose_prob_mask']
-        
-        if prob_mask:
-            masks = [1./(1.+np.exp(-mask)) for mask in masks if len(mask)>0]
-            
-        # combine the mask.
-        mask_combine  = usegment3D_filters.var_combine(masks, 
-                                                       ksize=params['combine_cell_probs']['ksize'],  # awesome... high ksize is good 
-                                                       alpha = params['combine_cell_probs']['alpha'], # was 1.0 
-                                                       eps=params['combine_cell_probs']['eps'])
-        
-        del masks # free up space.
-        
-        if params['combine_cell_probs']['smooth_sigma'] > 0:
-            mask_combine = ndimage.gaussian_filter(mask_combine, sigma=params['combine_cell_probs']['smooth_sigma']) # do less smoothing. 3 is prob still too much. 
-        
-        if params['combine_cell_probs']['prob_thresh'] is None:
-            prob_thresh_raw = skfilters.threshold_multiotsu(mask_combine, params['combine_cell_probs']['threshold_n_levels'])[params['combine_cell_probs']['threshold_level']]
-            
-            # additive offset on the automatic threshold (continuous in the Otsu value, unlike the legacy 1 d.p. floor). 
-            prob_thresh_offset = params['combine_cell_probs'].get('prob_thresh_offset', 0.)
-            prob_thresh = prob_thresh_raw + prob_thresh_offset
-            
-            if params['combine_cell_probs']['apply_one_d_p_thresh'] > 0:
-                # legacy: floor to 1 decimal point. 
-                prob_thresh = int(prob_thresh*10)/10.
-                
-            # enforce a minimum since statistically we can be skewed ... 
-            prob_thresh = np.maximum(params['combine_cell_probs']['min_prob_thresh'], prob_thresh)
-            print('Automatic binary thresholding: ', prob_thresh, '(multi-Otsu: %.4f, offset: %s, 1 d.p. floor: %s)' %(prob_thresh_raw, prob_thresh_offset, bool(params['combine_cell_probs']['apply_one_d_p_thresh'])))
-            
-            mask_binary = mask_combine >= prob_thresh
-        else:
-            mask_binary = mask_combine >= params['combine_cell_probs']['prob_thresh']
-        
-        
-        # """
-        # We can use a guided filter to try to refine!. 
-        # """
-        if params['postprocess_binary']['binary_closing'] > 0:
-            mask_binary = skmorph.binary_closing(mask_binary, skmorph.ball(params['postprocess_binary']['binary_closing']))
-        if params['postprocess_binary']['remove_small_objects'] > 0:
-            mask_binary = skmorph.remove_small_objects(mask_binary, 
-                                                       min_size=params['postprocess_binary']['remove_small_objects'],
-                                                       connectivity=2)
-        if params['postprocess_binary']['binary_dilation'] > 0:
-            mask_binary = skmorph.binary_dilation(mask_binary, skmorph.ball(params['postprocess_binary']['binary_dilation']))
-        if params['postprocess_binary']['binary_fill_holes'] > 0:
-            mask_binary = ndimage.binary_fill_holes(mask_binary)
-        if params['postprocess_binary']['extra_erode'] > 0:
-            mask_binary = skmorph.binary_erosion(mask_binary, skmorph.ball(params['postprocess_binary']['extra_erode']))
-    
+        masks = [np.clip(mask, -88.72, 88.72) for mask in probs if len(mask) > 0]
+
+        if params["combine_cell_probs"]["cellpose_prob_mask"]:
+            masks = [1.0 / (1.0 + np.exp(-mask)) for mask in masks]  # sigmoid
+
+        mask_combine = usegment3D_filters.var_combine(
+            masks,
+            ksize=params["combine_cell_probs"]["ksize"],
+            alpha=params["combine_cell_probs"]["alpha"],
+            eps=params["combine_cell_probs"]["eps"],
+        )
+        del masks
+
+        if params["combine_cell_probs"]["smooth_sigma"] > 0:
+            mask_combine = ndimage.gaussian_filter(
+                mask_combine, sigma=params["combine_cell_probs"]["smooth_sigma"]
+            )
+
+        mask_binary = _binarize_combined_probability(mask_combine, params)
     else:
-            
         mask_binary = precombined_binary.copy()
-        mask_combine = np.zeros(mask_binary.shape, dtype=np.float32); mask_combine[:] = np.nan
-    
-    
-    """
-    Second combining the gradients. var_combine, shouldn't matter about 0. 
-    """
+        mask_combine = _unknown_probability(mask_binary.shape)
+
+    # 2. combine the per-view 2D gradients into 3D gradients.
     im_shape = mask_binary.shape
-    
+
     if precombined_gradients is None:
-        # derive 
-        mask_gradients = []
-        
-        for gradient_ii, gradient in enumerate(gradients):
-            if len(gradient) > 0:
-                gradient = np.concatenate([np.zeros(im_shape, dtype=np.float32)[None,...], 
-                                                    gradient], axis=0)
-                if gradient_ii == 0: # xy 
-                    gradient = gradient[[0,1,2],...].copy()
-                if gradient_ii == 1: # xz 
-                    gradient = gradient[[1,0,2],...].copy()
-                if gradient_ii == 2: # xz
-                    gradient = gradient[[1,2,0],...].copy()
-            else:
-                gradient = [] # create a zero array. 
-            mask_gradients.append(gradient)
-            
-        """
-        Do filtering before combining by content. 
-        """
-        # do xy
-        if len(mask_gradients[0])>0 and len(mask_gradients[1])>0:
-            dx = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[0][2], sigma=params['combine_cell_gradients']['smooth_sigma']), 
-                                                 ndimage.gaussian_filter(mask_gradients[1][2], sigma=params['combine_cell_gradients']['smooth_sigma'])],
-                                                ksize=params['combine_cell_gradients']['ksize'],
-                                                alpha=params['combine_cell_gradients']['alpha'])
-        elif (len(mask_gradients[0])==0) and (len(mask_gradients[1])>0):
-            dx = ndimage.gaussian_filter(mask_gradients[1][2], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        elif len(mask_gradients[0])>0 and len(mask_gradients[1])==0:
-            dx = ndimage.gaussian_filter(mask_gradients[0][2], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        else:
-            dx = np.zeros(im_shape, dtype=np.float32)
-            
-        
-        if len(mask_gradients[0])>0 and len(mask_gradients[2])>0:
-            dy = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[0][1], sigma=params['combine_cell_gradients']['smooth_sigma']), 
-                                                  ndimage.gaussian_filter(mask_gradients[2][1], sigma=params['combine_cell_gradients']['smooth_sigma'])],
-                                                ksize=params['combine_cell_gradients']['ksize'],
-                                                alpha=params['combine_cell_gradients']['alpha'])
-        elif len(mask_gradients[0])==0 and len(mask_gradients[2])>0:
-            dy = ndimage.gaussian_filter(mask_gradients[2][1], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        elif len(mask_gradients[0])>0 and len(mask_gradients[2])==0:
-            dy = ndimage.gaussian_filter(mask_gradients[0][1], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        else:
-            dy = np.zeros(im_shape, dtype=np.float32)
-            
-        if len(mask_gradients[1])>0 and len(mask_gradients[2])>0:
-            dz = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[1][0], sigma=1), 
-                                                  ndimage.gaussian_filter(mask_gradients[2][0], sigma=1)],
-                                                ksize=params['combine_cell_gradients']['ksize'],
-                                                alpha=params['combine_cell_gradients']['alpha'])
-        elif len(mask_gradients[1])==0 and len(mask_gradients[2])>0:
-            dz = ndimage.gaussian_filter(mask_gradients[2][0], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        elif len(mask_gradients[1])>0 and len(mask_gradients[2])==0:
-            dz = ndimage.gaussian_filter(mask_gradients[1][0], sigma=params['combine_cell_gradients']['smooth_sigma'])
-        else:
-            dz = np.zeros(im_shape, dtype=np.float32)
-            
-    
-        del mask_gradients # free up space
-        
-        """
-        To do: further smoothing 
-        """
-    
-        dx = ndimage.gaussian_filter(dx, sigma=1.)
-        dy = ndimage.gaussian_filter(dy, sigma=1.)
-        dz = ndimage.gaussian_filter(dz, sigma=1.)
-        labels_gradients = np.concatenate([ dz[None,...], 
-                                            dy[None,...], 
-                                            dx[None,...] ], axis=0)
-        
-        del dx, dy, dz 
-    
-        """
-        Normalize the combined gradients. 
-        """
-        labels_gradients =labels_gradients / (np.linalg.norm(labels_gradients, axis=0)[None,...]+1e-20) 
-        labels_gradients = labels_gradients.transpose(1,2,3,0).astype(np.float32) # put in the orientation expected by gradient descent. 
-    
+        view_gradients = [
+            _view_gradient_to_zyx(gradient, view_index, im_shape) if len(gradient) > 0 else []
+            for view_index, gradient in enumerate(gradients)
+        ]
+        labels_gradients = _combine_view_gradients(view_gradients, params, im_shape)
+        del view_gradients
     else:
-        
         labels_gradients = precombined_gradients.copy()
-        
-        if len(labels_gradients) == 3: 
-            labels_gradients = labels_gradients / (np.linalg.norm(labels_gradients, axis=0)[None,...]+1e-20) 
-            labels_gradients = labels_gradients.transpose(1,2,3,0).astype(np.float32) # put in the orientation expected by gradient descent. 
-        else:
-            labels_gradients = labels_gradients / (np.linalg.norm(labels_gradients, axis=-1)[...,None]+1e-20) 
-    
-    
-    if (savefolder is not None) and (basename is not None):
-        savepicklefile = os.path.join(savefolder, basename+'_combined2D_3D_probs_gradients_outputs.pkl')
-        usegment3D_fio.write_pickle(savepicklefile, 
-                                    {'binary':mask_binary, 
-                                     'flow':labels_gradients,
-                                     'prob':mask_combine})
-        
-    """
-    Perform gradient descent aggregation with flag for MP. 
-    """ 
-    if params['gradient_descent']['do_mp']:
-        labels_3D_watershed, cell_seg_connected, tracks, votes_grid_acc = usegment3D_watershed.mp_gradient_watershed3D_binary(mask_binary>0, 
-                                                                                                                    gradient_img = labels_gradients,
-                                                                                                                    tile_shape=params['gradient_descent']['tile_shape'],
-                                                                                                                    tile_aspect=params['gradient_descent']['tile_aspect'],
-                                                                                                                    tile_overlap_ratio = params['gradient_descent']['tile_overlap_ratio'],
-                                                                                                                    momenta=params['gradient_descent']['momenta'], 
-                                                                                                                    divergence_rescale=False, # i don't think this was defined correct helps.... ----> this actually seems to help by putting random fiducials...... (not actually stable..) 
-                                                                                                                    smooth_sigma=params['connected_component']['smooth_sigma'], # use a larger for weird shapes!.  
-                                                                                                                    smooth_gradient=1., # this has no effect except divergence_rescale=True
-                                                                                                                    delta=params['gradient_descent']['delta'], 
-                                                                                                                    n_iter=params['gradient_descent']['n_iter'],
-                                                                                                                    gradient_decay=params['gradient_descent']['gradient_decay'],
-                                                                                                                    interp = params['gradient_descent']['interp'],
-                                                                                                                    binary_mask_gradient=params['gradient_descent']['binary_mask_gradient'],
-                                                                                                                    eps=params['gradient_descent']['eps'], 
-                                                                                                                    min_area=params['connected_component']['min_area'],
-                                                                                                                    thresh_factor=params['connected_component']['thresh_factor'],
-                                                                                                                    mask=None,
-                                                                                                                    use_connectivity=params['gradient_descent']['use_connectivity'],
-                                                                                                                    connectivity_alpha=params['gradient_descent']['connectivity_alpha'],
-                                                                                                                    renorm_gradient=params['gradient_descent']['renorm_gradient'],
-                                                                                                                    debug_viz=False) # can't visualize. 
-    else:
-        labels_3D_watershed, cell_seg_connected, tracks, votes_grid_acc = usegment3D_watershed.gradient_watershed3D_binary(mask_binary>0, 
-                                                                                                                    gradient_img = labels_gradients,
-                                                                                                                    momenta=params['gradient_descent']['momenta'], 
-                                                                                                                    divergence_rescale=False, # i don't think this was defined correct helps.... ----> this actually seems to help by putting random fiducials...... (not actually stable..) 
-                                                                                                                    smooth_sigma=params['connected_component']['smooth_sigma'], # use a larger for weird shapes!.  
-                                                                                                                    smooth_gradient=1., # this has no effect except divergence_rescale=True
-                                                                                                                    delta=params['gradient_descent']['delta'], 
-                                                                                                                    n_iter=params['gradient_descent']['n_iter'],
-                                                                                                                    gradient_decay=params['gradient_descent']['gradient_decay'],
-                                                                                                                    interp = params['gradient_descent']['interp'],
-                                                                                                                    binary_mask_gradient=params['gradient_descent']['binary_mask_gradient'],
-                                                                                                                    eps=params['gradient_descent']['eps'], 
-                                                                                                                    min_area=params['connected_component']['min_area'],
-                                                                                                                    thresh_factor=params['connected_component']['thresh_factor'],
-                                                                                                                    mask=None,
-                                                                                                                    use_connectivity=params['gradient_descent']['use_connectivity'],
-                                                                                                                    connectivity_alpha=params['gradient_descent']['connectivity_alpha'],
-                                                                                                                    renorm_gradient=params['gradient_descent']['renorm_gradient'],
-                                                                                                                    debug_viz=params['gradient_descent']['debug_viz'],
-                                                                                                                    sampling=params['gradient_descent']['sampling'],
-                                                                                                                    track_percent=params['gradient_descent']['track_percent'], 
-                                                                                                                    rand_seed=params['gradient_descent']['rand_seed'], 
-                                                                                                                    ref_initial_color_img=params['gradient_descent']['ref_initial_color_img'],
-                                                                                                                    ref_alpha=params['gradient_descent']['ref_alpha'], 
-                                                                                                                    saveplotsfolder= params['gradient_descent']['saveplotsfolder'],
-                                                                                                                    viewinit=params['gradient_descent']['viewinit']) # 50 seems not enough for 3D... as it is very connected. 
-        
-    if (savefolder is not None) and (basename is not None):
-        # save the final segmentation and in color. 
-        usegment3D_fio.save_segmentation(os.path.join(savefolder,
-                                                      basename+'_2D-to-3D_aggregated_u-Segment3D_direct_method.tif'), 
-                                         labels_3D_watershed)
-    
+
+        if len(labels_gradients) == 3:  # (3,Z,Y,X)
+            labels_gradients = labels_gradients / (
+                np.linalg.norm(labels_gradients, axis=0)[None, ...] + 1e-20
+            )
+            labels_gradients = labels_gradients.transpose(1, 2, 3, 0).astype(np.float32)
+        else:  # (Z,Y,X,3)
+            labels_gradients = labels_gradients / (
+                np.linalg.norm(labels_gradients, axis=-1)[..., None] + 1e-20
+            )
+
+    _save_combined_outputs(savefolder, basename, mask_binary, labels_gradients, mask_combine)
+
+    # 3. gradient descent to group voxels into cells.
+    labels_3D_watershed = _gradient_descent_segment(mask_binary, labels_gradients, params)
+
+    _save_aggregated_segmentation(savefolder, basename, labels_3D_watershed)
+
     return labels_3D_watershed, (mask_combine, labels_gradients)
 
 
+# =============================================================================
+# 3b. Indirect method: 2D instance segmentation masks as input
+# =============================================================================
+def _view_shape(img_xy_shape, view_index):
+    """Shape of the volume as seen (slice axis first) from view 0: xy, 1: xz or 2: yz."""
+    if view_index == 0:
+        return img_xy_shape
+    if view_index == 1:
+        return np.hstack(img_xy_shape)[[1, 0, 2]]
+    return np.hstack(img_xy_shape)[[2, 0, 1]]
 
-# make the equivalent below but for the indirect method which is more convoluted. 
-def aggregate_2D_to_3D_segmentation_indirect_method(segmentations, 
-                                                    params,
-                                                    img_xy_shape,
-                                                    precomputed_binary = None, # this is to allow for using externally computed / combined versions. 
-                                                    savefolder=None,
-                                                    basename=None):
-    
-    import numpy as np 
-    import scipy.ndimage as ndimage
-    import skimage.filters as skfilters
-    import skimage.morphology as skmorph
-    import os 
 
-    # check we always pass the correct number of masks    
-    assert(len(segmentations) == 3)
-    
+def _label_gradients_2D(mask, params):
+    """Per-slice 2D gradients of a view's label stack, as (2, N, A, B)."""
+    indirect = params["indirect_method"]
+
+    if indirect["dtform_method"] == "edt":
+        # euclidean distance transform: just take its gradient.
+        gradient = usegment3D_flows.distance_transform_labels_fast(mask * 1)
+        gradient = np.array(
+            [np.array(np.gradient(dist_slice)) for dist_slice in gradient]
+        ).transpose(1, 0, 2, 3)
+        return gradient / (np.linalg.norm(gradient, axis=0)[None, ...] + 1e-20)
+
+    skel_guide_image = usegment3D_flows.distance_transform_labels_fast(mask * 1)
+
+    n_processes = indirect["n_cpu"]
+    if n_processes is None:
+        n_processes = (mp.cpu_count() - 1) // 2
+
+    gradient = usegment3D_flows.distance_centroid_tform_flow_labels2D_dask(
+        mask * 1,
+        dtform_method=indirect["dtform_method"],
+        guide_image=skel_guide_image,
+        fixed_point_percentile=indirect["edt_fixed_point_percentile"],
+        n_processes=n_processes,
+        iter_factor=indirect["iter_factor"],
+        smooth_skel_sigma=indirect["smooth_skel_sigma"],
+        power_dist=indirect["power_dist"],
+    )
+    # drop the distance channel, keep the 2 gradient channels.
+    return gradient[:, 1:].transpose(1, 0, 2, 3).copy()
+
+
+def aggregate_2D_to_3D_segmentation_indirect_method(
+    segmentations,
+    params,
+    img_xy_shape,
+    precomputed_binary=None,  # this is to allow for using externally computed / combined versions.
+    savefolder=None,
+    basename=None,
+):
+    r"""Aggregate per-view 2D instance segmentations into a 3D instance segmentation.
+
+    Gradients are computed from each 2D label slice with the distance transform given by
+    ``params['indirect_method']['dtform_method']``; the rest is as the direct method.
+
+    Parameters
+    ----------
+    segmentations : list of 3
+        2D-slice label stacks for the xy (Z,Y,X), xz (Y,Z,X) and yz (X,Z,Y) views ([] for a missing view).
+    params : dict
+        as given by segment3D.parameters.get_2D_to_3D_aggregation_params
+    img_xy_shape : tuple
+        (Z,Y,X) shape of the volume.
+    precomputed_binary : (Z,Y,X) array, optional
+        use this foreground instead of combining the segmentations.
+
+    Returns
+    -------
+    labels_3D : (Z,Y,X) integer array
+    (mask_combine, labels_gradients) : the combined foreground probability and the (Z,Y,X,3) gradients.
     """
-    First derive the binary, if this is not presupplied.
-    """
-    
-    masks = [] # split this. 
-    
-    for mask_ii, mask in enumerate(segmentations):
-        
-        if len(mask) > 0:
-            masks.append(mask) # get the foreground
-        else:
-            if mask_ii == 0:
-                mask = np.zeros(img_xy_shape, dtype=np.uint16)
-            if mask_ii == 1:
-                mask = np.zeros(np.hstack(img_xy_shape)[[1,0,2]], dtype=np.uint16)
-            if mask_ii == 2:
-                mask = np.zeros(np.hstack(img_xy_shape)[[2,0,1]], dtype=np.uint16)
-            masks.append(mask)
-            
-    # combine the mask.
-    sigma = params['indirect_method']['smooth_binary']
-    
+    assert len(segmentations) == 3
+
+    # missing views are treated as empty segmentations.
+    masks = [
+        mask if len(mask) > 0 else np.zeros(_view_shape(img_xy_shape, view_index), dtype=np.uint16)
+        for view_index, mask in enumerate(segmentations)
+    ]
+
+    # 1. combine the per-view foregrounds into a 3D foreground.
     if precomputed_binary is None:
+        sigma = params["indirect_method"]["smooth_binary"]
+        binaries = [
+            (masks[0] > 0) * 1.0,
+            (masks[1] > 0).transpose(1, 0, 2) * 1.0,
+            (masks[2] > 0).transpose(1, 2, 0) * 1.0,
+        ]
         if sigma > 0:
-            mask_combine = usegment3D_filters.var_combine([ndimage.gaussian_filter((masks[0]>0)*1., sigma=sigma), 
-                                                           ndimage.gaussian_filter((masks[1]>0).transpose(1,0,2)*1., sigma=sigma), 
-                                                           ndimage.gaussian_filter((masks[2]>0).transpose(1,2,0)*1., sigma=sigma)], 
-                                                           ksize=params['combine_cell_probs']['ksize'],  # awesome... high ksize is good 
-                                                           alpha = params['combine_cell_probs']['alpha'], # was 1.0 
-                                                           eps=params['combine_cell_probs']['eps'])
-        else:
-            mask_combine = usegment3D_filters.var_combine([(masks[0]>0)*1., 
-                                                           (masks[1]>0).transpose(1,0,2)*1., 
-                                                           (masks[2]>0).transpose(1,2,0)*1.], 
-                                                           ksize=params['combine_cell_probs']['ksize'],  # awesome... high ksize is good 
-                                                           alpha = params['combine_cell_probs']['alpha'], # was 1.0 
-                                                           eps=params['combine_cell_probs']['eps'])
-        
-        #  rescale to combat only have partial views? 
-        mask_combine = np.clip(mask_combine / (np.max(mask_combine)+1e-12), 0, 1) # rescale to 0-1
-        
-        # further smooth the combined masks. 
-        if params['combine_cell_probs']['smooth_sigma'] > 0:
-            mask_combine = ndimage.gaussian_filter(mask_combine, sigma=params['combine_cell_probs']['smooth_sigma']) # do less smoothing. 3 is prob still too much. 
-        
-        if params['combine_cell_probs']['prob_thresh'] is None:
-            prob_thresh_raw = skfilters.threshold_multiotsu(mask_combine, params['combine_cell_probs']['threshold_n_levels'])[params['combine_cell_probs']['threshold_level']]
-            
-            # additive offset on the automatic threshold (continuous in the Otsu value, unlike the legacy 1 d.p. floor). 
-            prob_thresh_offset = params['combine_cell_probs'].get('prob_thresh_offset', 0.)
-            prob_thresh = prob_thresh_raw + prob_thresh_offset
-            
-            if params['combine_cell_probs']['apply_one_d_p_thresh'] > 0:
-                # legacy: floor to 1 decimal point. 
-                prob_thresh = int(prob_thresh*10)/10.
-                
-            # enforce a minimum since statistically we can be skewed ... 
-            prob_thresh = np.maximum(params['combine_cell_probs']['min_prob_thresh'], prob_thresh)
-            print('Automatic binary thresholding: ', prob_thresh, '(multi-Otsu: %.4f, offset: %s, 1 d.p. floor: %s)' %(prob_thresh_raw, prob_thresh_offset, bool(params['combine_cell_probs']['apply_one_d_p_thresh'])))
-            
-            mask_binary = mask_combine >= prob_thresh
-        else:
-            mask_binary = mask_combine >= params['combine_cell_probs']['prob_thresh']
-        
-        # """
-        # We can use a guided filter to try to refine!. 
-        # """
-        if params['postprocess_binary']['binary_closing'] > 0:
-            mask_binary = skmorph.binary_closing(mask_binary, skmorph.ball(params['postprocess_binary']['binary_closing']))
-        if params['postprocess_binary']['remove_small_objects'] > 0:
-            mask_binary = skmorph.remove_small_objects(mask_binary, 
-                                                       min_size=params['postprocess_binary']['remove_small_objects'],
-                                                       connectivity=2)
-        if params['postprocess_binary']['binary_dilation'] > 0:
-            mask_binary = skmorph.binary_dilation(mask_binary, skmorph.ball(params['postprocess_binary']['binary_dilation']))
-        if params['postprocess_binary']['binary_fill_holes'] > 0:
-            mask_binary = ndimage.binary_fill_holes(mask_binary)
-        if params['postprocess_binary']['extra_erode'] > 0:
-            mask_binary = skmorph.binary_erosion(mask_binary, skmorph.ball(params['postprocess_binary']['extra_erode']))
+            binaries = [ndimage.gaussian_filter(binary, sigma=sigma) for binary in binaries]
 
+        mask_combine = usegment3D_filters.var_combine(
+            binaries,
+            ksize=params["combine_cell_probs"]["ksize"],
+            alpha=params["combine_cell_probs"]["alpha"],
+            eps=params["combine_cell_probs"]["eps"],
+        )
+        del binaries
+
+        # rescale to 0-1 (to compensate for having only partial views).
+        mask_combine = np.clip(mask_combine / (np.max(mask_combine) + 1e-12), 0, 1)
+
+        if params["combine_cell_probs"]["smooth_sigma"] > 0:
+            mask_combine = ndimage.gaussian_filter(
+                mask_combine, sigma=params["combine_cell_probs"]["smooth_sigma"]
+            )
+
+        mask_binary = _binarize_combined_probability(mask_combine, params)
     else:
-            
         mask_binary = precomputed_binary.copy()
-        mask_combine = np.zeros(mask_binary.shape, dtype=np.float32); mask_combine[:] = np.nan
-    
-    """
-    Second compute the gradients using the selected distance transform and combine into 3D gradients. var_combine, shouldn't matter about 0. 
-    """
+        mask_combine = _unknown_probability(mask_binary.shape)
 
-    mask_gradients = []
-        
-    for mask_ii, mask in enumerate(masks):
-        
-        if mask.max() > 0: 
-            
-            if params['indirect_method']['dtform_method'] == 'edt':
-                # if euclidean then this is simple
-                gradient = usegment3D_flows.distance_transform_labels_fast(mask*1) # ensure int. 
-                gradient = np.array([np.array(np.gradient(dist_slice)) for dist_slice in gradient]).transpose(1,0,2,3) # this makes the vectors first dimension
-                gradient = gradient / (np.linalg.norm(gradient, axis=0)[None,...] + 1e-20)
-            
-            else:
-                skel_guide_image = usegment3D_flows.distance_transform_labels_fast(mask*1)
-                
-                n_processes = params['indirect_method']['n_cpu']
-                if n_processes is None:
-                    import multiprocess as mp 
-                    n_processes = (mp.cpu_count() - 1) // 2 # halve this? 
-                
-                gradient = usegment3D_flows.distance_centroid_tform_flow_labels2D_dask(mask*1, 
-                                                                                        dtform_method=params['indirect_method']['dtform_method'],
-                                                                                        guide_image=skel_guide_image,
-                                                                                        # guide_image = None, # this is not currently used. 
-                                                                                        fixed_point_percentile=params['indirect_method']['edt_fixed_point_percentile'], 
-                                                                                        n_processes=n_processes,
-                                                                                        iter_factor =  params['indirect_method']['iter_factor'], 
-                                                                                        smooth_skel_sigma=params['indirect_method']['smooth_skel_sigma'],
-                                                                                        power_dist=params['indirect_method']['power_dist'])
-                gradient = gradient[:,1:].transpose(1,0,2,3).copy() # this should now be the same size as the edt. 
-                
-            if mask_ii == 0: #(x,y)
-                gradient = gradient.transpose(0,1,2,3).astype(np.float32)
-            if mask_ii == 1: #(x,z)
-                gradient = gradient.transpose(0,2,1,3).astype(np.float32)
-            if mask_ii == 2: #(y,z)
-                gradient = gradient.transpose(0,2,3,1).astype(np.float32)
-                
-            gradient = np.concatenate([np.zeros(img_xy_shape, dtype=np.float32)[None,...], 
-                                                gradient], axis=0)
-            
-            # perform the relevant switches. 
-            if mask_ii == 0: # xy 
-                gradient = gradient[[0,1,2],...].copy()
-            if mask_ii == 1: # xz 
-                gradient = gradient[[1,0,2],...].copy()
-            if mask_ii == 2: # xz
-                gradient = gradient[[1,2,0],...].copy()
-                
-            mask_gradients.append(gradient) # make sure to append 
+    # 2. compute 2D gradients from the label masks and combine into 3D gradients.
+    view_gradients = []
+    for view_index, mask in enumerate(masks):
+        if mask.max() > 0:
+            gradient = _label_gradients_2D(mask, params)
+            gradient = gradient.transpose(_VIEW_TO_ZYX_AXES[view_index]).astype(np.float32)
+            view_gradients.append(_view_gradient_to_zyx(gradient, view_index, img_xy_shape))
         else:
-            mask_gradients.append([]) # everything is zero so nothing to transpose and flip. 
-            
-    
-    """
-    Do filtering before combining by content. 
-    """
-    # do xy
-    if len(mask_gradients[0])>0 and len(mask_gradients[1])>0:
-        dx = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[0][2], sigma=params['combine_cell_gradients']['smooth_sigma']), 
-                                             ndimage.gaussian_filter(mask_gradients[1][2], sigma=params['combine_cell_gradients']['smooth_sigma'])],
-                                            ksize=params['combine_cell_gradients']['ksize'],
-                                            alpha=params['combine_cell_gradients']['alpha'])
-    elif (len(mask_gradients[0])==0) and (len(mask_gradients[1])>0):
-        dx = ndimage.gaussian_filter(mask_gradients[1][2], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    elif len(mask_gradients[0])>0 and len(mask_gradients[1])==0:
-        dx = ndimage.gaussian_filter(mask_gradients[0][2], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    else:
-        dx = np.zeros(img_xy_shape, dtype=np.float32)
-        
-    
-    if len(mask_gradients[0])>0 and len(mask_gradients[2])>0:
-        dy = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[0][1], sigma=params['combine_cell_gradients']['smooth_sigma']), 
-                                              ndimage.gaussian_filter(mask_gradients[2][1], sigma=params['combine_cell_gradients']['smooth_sigma'])],
-                                            ksize=params['combine_cell_gradients']['ksize'],
-                                            alpha=params['combine_cell_gradients']['alpha'])
-    elif len(mask_gradients[0])==0 and len(mask_gradients[2])>0:
-        dy = ndimage.gaussian_filter(mask_gradients[2][1], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    elif len(mask_gradients[0])>0 and len(mask_gradients[2])==0:
-        dy = ndimage.gaussian_filter(mask_gradients[0][1], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    else:
-        dy = np.zeros(img_xy_shape, dtype=np.float32)
-        
-    if len(mask_gradients[1])>0 and len(mask_gradients[2])>0:
-        dz = usegment3D_filters.var_combine([ndimage.gaussian_filter(mask_gradients[1][0], sigma=1), 
-                                              ndimage.gaussian_filter(mask_gradients[2][0], sigma=1)],
-                                            ksize=params['combine_cell_gradients']['ksize'],
-                                            alpha=params['combine_cell_gradients']['alpha'])
-    elif len(mask_gradients[1])==0 and len(mask_gradients[2])>0:
-        dz = ndimage.gaussian_filter(mask_gradients[2][0], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    elif len(mask_gradients[1])>0 and len(mask_gradients[2])==0:
-        dz = ndimage.gaussian_filter(mask_gradients[1][0], sigma=params['combine_cell_gradients']['smooth_sigma'])
-    else:
-        dz = np.zeros(img_xy_shape, dtype=np.float32)
+            view_gradients.append([])  # empty view: nothing to transpose and flip.
 
-    del mask_gradients # free up space
-        
-    """
-    To do: ** further smoothing **
-    """
-    dx = ndimage.gaussian_filter(dx, sigma=1.)
-    dy = ndimage.gaussian_filter(dy, sigma=1.)
-    dz = ndimage.gaussian_filter(dz, sigma=1.)
-    labels_gradients = np.concatenate([ dz[None,...], 
-                                        dy[None,...], 
-                                        dx[None,...] ], axis=0)
-    
-    del dx, dy, dz 
-    
-    """
-    Normalize the combined gradients. 
-    """
-    labels_gradients =labels_gradients / (np.linalg.norm(labels_gradients, axis=0)[None,...]+1e-20) 
-    labels_gradients = labels_gradients.transpose(1,2,3,0).astype(np.float32) # put in the orientation expected by gradient descent. 
-    
+    labels_gradients = _combine_view_gradients(view_gradients, params, img_xy_shape)
+    del view_gradients
 
-    if (savefolder is not None) and (basename is not None):
-        savepicklefile = os.path.join(savefolder, basename+'_combined2D_3D_probs_gradients_outputs.pkl')
-        usegment3D_fio.write_pickle(savepicklefile, 
-                                    {'binary':mask_binary, 
-                                     'flow':labels_gradients,
-                                     'prob':mask_combine})
-        
-    """
-    Perform gradient descent aggregation with flag for MP. (and this is identical to that of the direct method. )
-    """ 
-    if params['gradient_descent']['do_mp']:
-        labels_3D_watershed, cell_seg_connected, tracks, votes_grid_acc = usegment3D_watershed.mp_gradient_watershed3D_binary(mask_binary>0, 
-                                                                                                                    gradient_img = labels_gradients,
-                                                                                                                    tile_shape=params['gradient_descent']['tile_shape'],
-                                                                                                                    tile_aspect=params['gradient_descent']['tile_aspect'],
-                                                                                                                    tile_overlap_ratio = params['gradient_descent']['tile_overlap_ratio'],
-                                                                                                                    momenta=params['gradient_descent']['momenta'], 
-                                                                                                                    divergence_rescale=False, # i don't think this was defined correct helps.... ----> this actually seems to help by putting random fiducials...... (not actually stable..) 
-                                                                                                                    smooth_sigma=params['connected_component']['smooth_sigma'], # use a larger for weird shapes!.  
-                                                                                                                    smooth_gradient=1., # this has no effect except divergence_rescale=True
-                                                                                                                    delta=params['gradient_descent']['delta'], 
-                                                                                                                    n_iter=params['gradient_descent']['n_iter'],
-                                                                                                                    gradient_decay=params['gradient_descent']['gradient_decay'],
-                                                                                                                    interp = params['gradient_descent']['interp'],
-                                                                                                                    binary_mask_gradient=params['gradient_descent']['binary_mask_gradient'],
-                                                                                                                    eps=params['gradient_descent']['eps'], 
-                                                                                                                    min_area=params['connected_component']['min_area'],
-                                                                                                                    thresh_factor=params['connected_component']['thresh_factor'],
-                                                                                                                    mask=None,
-                                                                                                                    use_connectivity=params['gradient_descent']['use_connectivity'],
-                                                                                                                    connectivity_alpha=params['gradient_descent']['connectivity_alpha'],
-                                                                                                                    renorm_gradient=params['gradient_descent']['renorm_gradient'],
-                                                                                                                    debug_viz=False) # can't visualize. 
-    else:
-        labels_3D_watershed, cell_seg_connected, tracks, votes_grid_acc = usegment3D_watershed.gradient_watershed3D_binary(mask_binary>0, 
-                                                                                                                    gradient_img = labels_gradients,
-                                                                                                                    momenta=params['gradient_descent']['momenta'], 
-                                                                                                                    divergence_rescale=False, # i don't think this was defined correct helps.... ----> this actually seems to help by putting random fiducials...... (not actually stable..) 
-                                                                                                                    smooth_sigma=params['connected_component']['smooth_sigma'], # use a larger for weird shapes!.  
-                                                                                                                    smooth_gradient=1., # this has no effect except divergence_rescale=True
-                                                                                                                    delta=params['gradient_descent']['delta'], 
-                                                                                                                    n_iter=params['gradient_descent']['n_iter'],
-                                                                                                                    gradient_decay=params['gradient_descent']['gradient_decay'],
-                                                                                                                    interp = params['gradient_descent']['interp'],
-                                                                                                                    binary_mask_gradient=params['gradient_descent']['binary_mask_gradient'],
-                                                                                                                    eps=params['gradient_descent']['eps'], 
-                                                                                                                    min_area=params['connected_component']['min_area'],
-                                                                                                                    thresh_factor=params['connected_component']['thresh_factor'],
-                                                                                                                    mask=None,
-                                                                                                                    use_connectivity=params['gradient_descent']['use_connectivity'],
-                                                                                                                    connectivity_alpha=params['gradient_descent']['connectivity_alpha'],
-                                                                                                                    renorm_gradient=params['gradient_descent']['renorm_gradient'],
-                                                                                                                    debug_viz=params['gradient_descent']['debug_viz'],
-                                                                                                                    sampling=params['gradient_descent']['sampling'],
-                                                                                                                    track_percent=params['gradient_descent']['track_percent'], 
-                                                                                                                    rand_seed=params['gradient_descent']['rand_seed'], 
-                                                                                                                    ref_initial_color_img=params['gradient_descent']['ref_initial_color_img'],
-                                                                                                                    ref_alpha=params['gradient_descent']['ref_alpha'], 
-                                                                                                                    saveplotsfolder= params['gradient_descent']['saveplotsfolder'],
-                                                                                                                    viewinit=params['gradient_descent']['viewinit']) # 50 seems not enough for 3D... as it is very connected. 
-        
-    if (savefolder is not None) and (basename is not None):
-        # save the final segmentation and in color. 
-        usegment3D_fio.save_segmentation(os.path.join(savefolder,
-                                                      basename+'_2D-to-3D_aggregated_u-Segment3D_direct_method.tif'), 
-                                         labels_3D_watershed)
-    
+    _save_combined_outputs(savefolder, basename, mask_binary, labels_gradients, mask_combine)
+
+    # 3. gradient descent to group voxels into cells (identical to the direct method).
+    labels_3D_watershed = _gradient_descent_segment(mask_binary, labels_gradients, params)
+
+    _save_aggregated_segmentation(savefolder, basename, labels_3D_watershed)
+
     return labels_3D_watershed, (mask_combine, labels_gradients)
 
 
-def postprocess_3D_cell_segmentation(segmentation,
-                                     aggregation_params,
-                                     postprocess_params,
-                                     cell_gradients=None,
-                                     savefolder=None,
-                                     basename=None):
-    
-    
+# =============================================================================
+# 4. Postprocessing
+# =============================================================================
+def _remove_large_labels(segmentation, max_size=None, max_size_factor=None):
+    """Zero out (in place) labels larger than max_size, or larger than mean + max_size_factor * std."""
+    uniq_labels = np.setdiff1d(np.unique(segmentation), 0)
+    regions = skmeasure.regionprops(segmentation)
+    areas = np.hstack([re.area for re in regions])
+
+    if max_size is not None:
+        area_thresh = max_size
+    else:
+        area_thresh = np.nanmean(areas) + max_size_factor * np.nanstd(areas)
+
+    if np.sum(areas > area_thresh):
+        for rr in np.arange(len(uniq_labels))[areas > area_thresh]:
+            coords = regions[rr].coords
+            segmentation[coords[:, 0], coords[:, 1], coords[:, 2]] = 0
+
+
+def _consistency_slice_gradients(stack, flow_params, n_cpu):
+    """Per-slice 2D gradients (N, 2, A, B) of a label stack, for the flow consistency check."""
+    dtform_method = flow_params["dtform_method"]
+
+    if dtform_method == "edt":
+        gradient = usegment3D_flows.distance_transform_labels_fast(stack * 1, n_threads=n_cpu)
+        gradient = np.array([np.array(np.gradient(dist_slice)) for dist_slice in gradient])
+        return gradient / (np.linalg.norm(gradient, axis=1)[:, None] + 1e-20)
+
+    guide = usegment3D_flows.distance_transform_labels_fast(stack, n_threads=n_cpu)
+
+    def _compute_cellflow_view(slice_id):
+        return usegment3D_flows.distance_centroid_tform_flow_labels2D(
+            stack[slice_id],
+            dtform_method=dtform_method,
+            guide_img=guide[slice_id],
+            fixed_point_percentile=flow_params["edt_fixed_point_percentile"],
+            iter_factor=flow_params["iter_factor"],
+            smooth_skel_sigma=flow_params["smooth_skel_sigma"],
+            power_dist=flow_params["power_dist"],
+        )
+
+    with mp.Pool(n_cpu) as pool:
+        gradient = pool.map(_compute_cellflow_view, range(0, len(stack)))
+    # drop the distance channel, keep the 2 gradient channels.
+    return np.array(gradient, dtype=np.float32)[:, 1:]
+
+
+def _reconstruct_cell_gradients(segmentation, aggregation_params, flow_params, n_cpu):
+    """Recompute 3D (3,Z,Y,X) unit gradients from a 3D segmentation, as the indirect method would."""
+    dtform_method = flow_params["dtform_method"]
+
+    view_gradients = []
+    for view_index, (view, view_axes, _, _) in enumerate(usegment3D_flows._VIEWS):
+        stack = segmentation.transpose(view_axes).copy()
+        if dtform_method != "edt":
+            print("start " + view)
+        gradient = _consistency_slice_gradients(stack, flow_params, n_cpu)
+        view_gradients.append(usegment3D_flows._view_gradients_to_zyx(gradient, view_index))
+        print("finish " + view)
+        del stack
+
+    gc.collect()
+
+    gradient_xy, gradient_xz, gradient_yz = view_gradients
+    gradient_params = aggregation_params["combine_cell_gradients"]
+    shape = segmentation.shape
+    dx = _fuse_two_views(gradient_xy[:, 2], gradient_xz[:, 2], gradient_params, shape)
+    dy = _fuse_two_views(gradient_xy[:, 1], gradient_yz[:, 1], gradient_params, shape)
+    dz = _fuse_two_views(gradient_xz[:, 0], gradient_yz[:, 0], gradient_params, shape)
+
+    return _smooth_stack_and_normalize(dz, dy, dx)
+
+
+def postprocess_3D_cell_segmentation(
+    segmentation,
+    aggregation_params,
+    postprocess_params,
+    cell_gradients=None,
+    savefolder=None,
+    basename=None,
+):
+    r"""Clean up a 3D segmentation.
+
+    1. size filters (minimum size, optional maximum size), keeping the largest component per label.
+    2. flow consistency: remove cells whose re-derived gradients disagree with ``cell_gradients``.
+    3. statistical size filter (remove cells larger than mean + max_size_factor * std).
+
+    Parameters
+    ----------
+    segmentation : (Z,Y,X) integer array
+    aggregation_params : dict
+        the parameters used for the aggregation (get_2D_to_3D_aggregation_params).
+    postprocess_params : dict
+        as given by segment3D.parameters.get_postprocess_segmentation_params
+    cell_gradients : (Z,Y,X,3) array, optional
+        the combined 3D gradients used to create the segmentation. Required for step 2.
+
+    Returns
+    -------
+    segmentation_filt : (Z,Y,X) integer array
+    flow_consistency_outputs : list
+        [flow_errors, reconstructed gradients (Z,Y,X,3)] if any cells were removed in step 2.
+    """
     from cellpose.utils import fill_holes_and_remove_small_masks
-    import scipy.ndimage as ndimage
-    import skimage.measure as skmeasure 
-    import gc
-    
-    
-    segmentation_filt = segmentation.copy()
-    
+
+    params = postprocess_params
     flow_consistency_outputs = []
-    
-    """
-    1. size filter. 
-    """
-    params = postprocess_params.copy()
-    
-    # minimum size filter. 
-    if params['size_filters']['min_size']>0:
-        # remove small regions and keep one label? 
-        segmentation_filt = fill_holes_and_remove_small_masks(segmentation, 
-                                                              min_size=params['size_filters']['min_size']) ### this should be implemented to not depend on cellpose!. 
-    # maximum size filter. 
-    if params['size_filters']['max_size'] is not None:
 
-        uniq_labels = np.setdiff1d(np.unique(segmentation_filt), 0) 
-        regions = skmeasure.regionprops(segmentation_filt)
-        
-        areas = np.hstack([re.area for re in regions])
-        area_thresh = params['size_filters']['max_size']
-        
-        if np.sum(areas>area_thresh): # there are regions greater than this threshold 
-            remove_labels_indices = np.arange(len(uniq_labels))[areas>area_thresh]
-            # remove_labels = uniq_labels[remove_labels_indices]
-            
-            for rr in remove_labels_indices:
-                coords = regions[rr].coords
-                segmentation_filt[coords[:,0], coords[:,1], coords[:,2]] = 0 
-                
-    
-    segmentation_filt = usegment3D_filters.largest_component_vol_labels_fast(segmentation_filt, connectivity=1)
-    
-    
-    """
-    2. flow consistency filter. 
-    """
-    # In general we do this except 
-    if params['flow_consistency']['do_flow_remove'] and cell_gradients is not None: 
-        
-        # do the multiprocess. 
-        import multiprocess as mp # this version allows pickling. 
-        # import multiprocessing as mp
-        
-        dtform_method = params['flow_consistency']['dtform_method']
-        n_cpu = params['flow_consistency']['n_cpu']
-        
+    # 1. size filters.
+    segmentation_filt = segmentation.copy()
+
+    if params["size_filters"]["min_size"] > 0:
+        segmentation_filt = fill_holes_and_remove_small_masks(
+            segmentation, min_size=params["size_filters"]["min_size"]
+        )
+    if params["size_filters"]["max_size"] is not None:
+        _remove_large_labels(segmentation_filt, max_size=params["size_filters"]["max_size"])
+
+    segmentation_filt = usegment3D_filters.largest_component_vol_labels_fast(
+        segmentation_filt, connectivity=1
+    )
+
+    # 2. flow consistency filter.
+    if params["flow_consistency"]["do_flow_remove"] and cell_gradients is not None:
+        n_cpu = params["flow_consistency"]["n_cpu"]
         if n_cpu is None:
-            n_cpu = np.maximum(mp.cpu_count() - 1,1)
-            
-        
-        tmp = segmentation_filt.copy()
+            n_cpu = np.maximum(mp.cpu_count() - 1, 1)
 
-        if dtform_method != 'edt':
-            ### we should run the below if dtform_method is not edt... otherwise edt is much much simpler. 
-            guide = usegment3D_flows.distance_transform_labels_fast(tmp, n_threads=n_cpu)
-            
-            def _compute_cellflow_view(slice_id): # can't really pickle this. 
-                # out = grad_flows.distance_centroid_tform_flow_labels2D()
-                
-                if dtform_method == 'edt':
-                    # this is just the guide
-                    out = usegment3D_flows.distance_transform_labels_fast(tmp[slice_id], n_threads=n_cpu)
-                    out_flow = np.array(np.gradient(out))
-                    out_flow = out_flow / (np.linalg.norm(out, axis=0)[None,...] + 1e-20)
-                    out = np.concatenate([out[None,...], out_flow], axis=0)
-                else:    
-                    out = usegment3D_flows.distance_centroid_tform_flow_labels2D(tmp[slice_id], 
-                                                                            dtform_method=dtform_method,
-                                                                            guide_img=guide[slice_id], 
-                                                                            fixed_point_percentile=params['flow_consistency']['edt_fixed_point_percentile'], 
-                                                                            iter_factor=params['flow_consistency']['iter_factor'],
-                                                                            smooth_skel_sigma=params['flow_consistency']['smooth_skel_sigma'],
-                                                                            power_dist=params['flow_consistency']['power_dist'])
-                return out 
-            
-            
-            print('start xy')
-            # do xy first. 
-            with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool: 
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
-                gradient_xy = pool.map(_compute_cellflow_view, range(0, len(tmp)))
-                gradient_xy = np.array(gradient_xy, dtype=np.float32) #.transpose(1,0,2,3)
-                gradient_xy = gradient_xy[:,1:]
-                gradient_xy = np.concatenate([np.zeros_like(gradient_xy[:,1])[:,None,...], gradient_xy], axis=1)
-                gradient_xy = gradient_xy[:,[0,1,2],...] #.copy() # we must flip the channels!. 
-            print('finish xy')
-                
-            # do xz 
-            tmp = segmentation_filt.transpose(1,0,2).copy()
-            guide = usegment3D_flows.distance_transform_labels_fast(tmp, n_threads=n_cpu)
-            
-            print('start xz')
-            with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool: 
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
-                gradient_xz = pool.map(_compute_cellflow_view, range(0, len(tmp)))
-                gradient_xz = np.array(gradient_xz,dtype=np.float32)#.transpose(1,0,2,3)
-                gradient_xz = gradient_xz[:,1:].copy()
-                gradient_xz = gradient_xz.transpose( 2,1,0,3 )
-                gradient_xz = np.concatenate([np.zeros_like(gradient_xz[:,1])[:,None,...], gradient_xz], axis=1)
-                gradient_xz = gradient_xz[:,[1,0,2],...]#.copy() # we must flip the channels!. 
-            print('finish xz')
-                
-            # do yz 
-            tmp = segmentation_filt.transpose(2,0,1).copy()
-            guide = usegment3D_flows.distance_transform_labels_fast(tmp, n_threads=n_cpu)
-            
-            print('start yz')
-            with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool:
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
-                gradient_yz = pool.map(_compute_cellflow_view, range(0, len(tmp)))
-                gradient_yz = np.array(gradient_yz,dtype=np.float32)#.transpose(1,0,2,3)
-                gradient_yz = gradient_yz[:,1:] ; gradient_yz = gradient_yz.transpose(2,1,3,0) 
-                gradient_yz = np.concatenate([np.zeros_like(gradient_yz[:,1])[:,None,...], gradient_yz], axis=1)
-                gradient_yz = gradient_yz[:,[1,2,0],...] #.copy() # we must flip the channels!. 
-            print('finish yz')
-            
-            del guide
-        
-        else:
-            # do xy
-            tmp = segmentation_filt.copy()
-            gradient_xy = usegment3D_flows.distance_transform_labels_fast(tmp*1,n_threads=n_cpu)
-            gradient_xy = np.array([np.array(np.gradient(dist_slice)) for dist_slice in gradient_xy])
-            gradient_xy = gradient_xy / (np.linalg.norm(gradient_xy, axis=1)[:,None] + 1e-20)
-            gradient_xy = np.concatenate([np.zeros_like(gradient_xy[:,1])[:,None,...], gradient_xy], axis=1)
-            gradient_xy = gradient_xy[:,[0,1,2],...] #.copy() # we must flip the channels!. 
-            print('finish xy')
-            
-            # do xz 
-            tmp = segmentation_filt.transpose(1,0,2).copy()
-            gradient_xz = usegment3D_flows.distance_transform_labels_fast(tmp*1, n_threads=n_cpu)
-            gradient_xz = np.array([np.array(np.gradient(dist_slice)) for dist_slice in gradient_xz])
-            gradient_xz = gradient_xz / (np.linalg.norm(gradient_xz, axis=1)[:,None] + 1e-20)
-            gradient_xz = gradient_xz.transpose( 2,1,0,3 )
-            gradient_xz = np.concatenate([np.zeros_like(gradient_xz[:,1])[:,None,...], gradient_xz], axis=1)
-            gradient_xz = gradient_xz[:,[1,0,2],...]#.copy() # we must flip the channels!. 
-            print('finish xz')
-            
-            # do yz 
-            tmp = segmentation_filt.transpose(2,0,1).copy()
-            gradient_yz = usegment3D_flows.distance_transform_labels_fast(tmp*1, n_threads=n_cpu)
-            gradient_yz = np.array([np.array(np.gradient(dist_slice)) for dist_slice in gradient_yz])
-            gradient_yz = gradient_yz / (np.linalg.norm(gradient_yz, axis=1)[:,None] + 1e-20)
-            gradient_yz = gradient_yz.transpose(2,1,3,0) 
-            gradient_yz = np.concatenate([np.zeros_like(gradient_yz[:,1])[:,None,...], gradient_yz], axis=1)
-            gradient_yz = gradient_yz[:,[1,2,0],...] #.copy() # we must flip the channels!. 
-            print('finish yz')
-        
-        """
-        implement the combination. 
-        """
-        del tmp
-        
-        gc.collect() # Forces garbage collection
-        
-            
-        dx = usegment3D_filters.var_combine([ndimage.gaussian_filter(gradient_xy[:,2], sigma=aggregation_params['combine_cell_gradients']['smooth_sigma']), 
-                                       ndimage.gaussian_filter(gradient_xz[:,2], sigma=aggregation_params['combine_cell_gradients']['smooth_sigma'])],
-                                      ksize=aggregation_params['combine_cell_gradients']['ksize'],
-                                      alpha=aggregation_params['combine_cell_gradients']['alpha'])
-        dy = usegment3D_filters.var_combine([ndimage.gaussian_filter(gradient_xy[:,1],sigma=aggregation_params['combine_cell_gradients']['smooth_sigma']), 
-                                        ndimage.gaussian_filter(gradient_yz[:,1],sigma=aggregation_params['combine_cell_gradients']['smooth_sigma'])],
-                                      ksize=aggregation_params['combine_cell_gradients']['ksize'], # we probably need to tune this up! for this imaging 
-                                      alpha=aggregation_params['combine_cell_gradients']['alpha'])
-        dz = usegment3D_filters.var_combine([ndimage.gaussian_filter(gradient_xz[:,0], sigma=aggregation_params['combine_cell_gradients']['smooth_sigma']), 
-                                        ndimage.gaussian_filter(gradient_yz[:,0], sigma=aggregation_params['combine_cell_gradients']['smooth_sigma'])],
-                                      ksize=aggregation_params['combine_cell_gradients']['ksize'],
-                                      alpha=aggregation_params['combine_cell_gradients']['alpha'])
-        
-        # further implement the post filtering. 
-        dx = ndimage.gaussian_filter(dx, sigma=1.)
-        dy = ndimage.gaussian_filter(dy, sigma=1.)
-        dz = ndimage.gaussian_filter(dz, sigma=1.)
-        
-        dzyx = np.concatenate([ dz[:,None,...], 
-                                dy[:,None,...], 
-                                dx[:,None,...] ], axis=1)
-        del dx, dy, dz
-        
-        # do a little filtering. 
-        dzyx = dzyx.transpose(1,0,2,3)
-        dzyx = dzyx / (np.linalg.norm(dzyx, axis=0)[None,...] + 1e-20) # do a renormalize!. 
+        dzyx = _reconstruct_cell_gradients(
+            segmentation_filt, aggregation_params, params["flow_consistency"], n_cpu
+        )
 
+        # mean squared error between the reconstructed and given gradients, per label.
+        n_labels = segmentation_filt.max()
+        flow_errors = usegment3D_flows._flow_errors(
+            dzyx, cell_gradients.transpose(3, 0, 1, 2), segmentation_filt
+        )
 
-        print('finished computing gradients and removing bad flow masks ...')
-        flow_errors=np.zeros(segmentation_filt.max())
-        for i in range(dzyx.shape[0]): # over the 3 dimensions. # this should be fast. 
-            flow_errors += ndimage.mean((dzyx[i] - cell_gradients.transpose(3,0,1,2)[i])**2, 
-                                        segmentation_filt,
-                                        index=np.arange(1, segmentation_filt.max()+1))
-        flow_errors[np.isnan(flow_errors)] = 0 # zero out any nan entries!. 
-            
-        
-        error_labels = flow_errors > params['flow_consistency']['flow_threshold']
-        
+        error_labels = flow_errors > params["flow_consistency"]["flow_threshold"]
+
         if np.sum(error_labels) > 0:
-            # perform correction.     
             valid_labels = np.setdiff1d(np.unique(segmentation_filt), 0)
-            reg_error_labels = np.arange(1, segmentation_filt.max()+1)[error_labels] # these are the labels to remove!. 
+            reg_error_labels = np.arange(1, n_labels + 1)[error_labels]
             reg_error_labels = np.intersect1d(reg_error_labels, valid_labels)
-            
-            reg_error_labels_indices = np.hstack([np.arange(len(valid_labels))[valid_labels==ll] for ll in reg_error_labels])
-            
-            # set these regions to 0. 
+
+            # regionprops are in label order, so index them by position in valid_labels.
+            reg_error_labels_indices = np.hstack(
+                [np.arange(len(valid_labels))[valid_labels == ll] for ll in reg_error_labels]
+            )
+
             mask_new = segmentation_filt.copy()
-            mask_regionprops = skmeasure.regionprops(segmentation_filt) # use this. 
-            
-            for lab in reg_error_labels_indices: # so this need to be faster. but how ? 
-                # mask_new[mask==lab] = 0
+            mask_regionprops = skmeasure.regionprops(segmentation_filt)
+
+            for lab in reg_error_labels_indices:
                 coords = mask_regionprops[lab].coords
-                mask_new[coords[:,0],
-                         coords[:,1],
-                         coords[:,2]] = 0
-                
+                mask_new[coords[:, 0], coords[:, 1], coords[:, 2]] = 0
+
             segmentation_filt = mask_new.copy()
-            flow_consistency_outputs.append([flow_errors, dzyx.transpose(1,2,3,0)]) # the transpose is to return in the same shape as cell gradients. 
-            
+            # the transpose returns the gradients in the same layout as cell_gradients.
+            flow_consistency_outputs.append([flow_errors, dzyx.transpose(1, 2, 3, 0)])
+
             del mask_new
-            
-            # # check also the below: which might be easier to call. # wwe should use this method. 
-            # segmentation_filt, flow_errors, ref_cell_gradients = grad_flows.remove_bad_flow_masks_3D(segmentation_filt, 
-            #                                                                              cell_gradients.transpose(3,0,1,2),
-            #                                                                              flow_threshold=flow_threshold, # get rid of only the very worst ones! 
-            #                                                                              n_processes=mp.cpu_count-1) # set a generous threshold.
-            
-            # remove_bad_flow_masks_3D(mask, 
-            #                  flow, 
-            #                  flow_threshold=0.6,
-            #                  dtform_method='cellpose_improve',  
-            #                  fixed_point_percentile=0.01, 
-            #                  n_processes=4,
-            #                  power_dist=None,
-            #                  alpha=0.5, 
-            #                  smooth_sigma=0,
-            #                  smooth_ds=1,
-            #                  filter_scale = 1)
-    """
-    3. statistical size filter
-    """
-    
-    if params['size_filters']['do_stats_filter']:
-    
-        uniq_labels = np.setdiff1d(np.unique(segmentation_filt), 0) 
-        regions = skmeasure.regionprops(segmentation_filt)
-        
-        areas = np.hstack([re.area for re in regions])
-        area_thresh = np.nanmean(areas) + params['size_filters']['max_size_factor']*np.nanstd(areas)
-        
-        if np.sum(areas>area_thresh):
-            remove_labels_indices = np.arange(len(uniq_labels))[areas>area_thresh]
-            # remove_labels = uniq_labels[remove_labels_indices]
-            
-            for rr in remove_labels_indices:
-                coords = regions[rr].coords
-                segmentation_filt[coords[:,0], coords[:,1], coords[:,2]] = 0 
-                
-        
+
+    # 3. statistical size filter.
+    if params["size_filters"]["do_stats_filter"]:
+        _remove_large_labels(
+            segmentation_filt, max_size_factor=params["size_filters"]["max_size_factor"]
+        )
+
     return segmentation_filt, flow_consistency_outputs
-        
-        
-        
-# # label diffusion and guided filtering 
-def label_diffuse_3D_cell_segmentation_MP(segmentation,
-                                          guide_image,
-                                          params): # does this work as module or else, we may need to implement in main.... 
-    
-    import skimage.measure as skmeasure
-    import multiprocess as mp 
-    import numpy as np
-    
-    n_cpu = params['diffusion']['n_cpu']
-    if n_cpu is None:
-        n_cpu = np.maximum(mp.cpu_count() - 1,1)
-    
-    # guide_img must be in range 0, 1, enforce here. 
-    guide_img = usegment3D_filters.normalize(guide_image, 
-                                               pmin=params['guide_img']['pmin'], 
-                                               pmax=params['guide_img']['pmax'], clip=True)
-    
-    """
-    define the parameters upfront
-    """
-    refine_clamp = params['diffusion']['refine_clamp']
-    refine_iters = params['diffusion']['refine_iters']
-    refine_alpha = params['diffusion']['refine_alpha']
-    noprogress_bool = params['diffusion']['noprogress_bool']
-    affinity_type = params['diffusion']['affinity_type']
-    
-    multilabel_refine = params['diffusion']['multilabel_refine']
-    
-    
-    # some setup. 
-    pad_size = params['diffusion']['pad_size']
-    
-    pad = np.hstack([pad_size,pad_size,pad_size])
-    padding = ((pad_size,pad_size), (pad_size,pad_size), (pad_size,pad_size))
-    guide_img_pad = np.pad(guide_img, padding, mode='reflect')
-    
-    segmentation_pad = np.pad(segmentation, padding, mode='constant')*1 # maybe this will be fine!
-    
-    # print(guide_img_pad.shape, segmentation_pad.shape)
-    # print(segmentation_pad.max())
-    
-    # find out the individual cell ids
-    cells = skmeasure.regionprops(segmentation_pad)
-    cells_id = np.setdiff1d(np.unique(segmentation_pad), 0 ) # exclude the background label
-    
-    # print(len(cells))
-    bboxes = [cells[ii].bbox for ii in range(0, len(cells))]
-    
-    """
-    define the internal function
-    """
-    def _refine_single_obj(obj_id):
-        
-        # bbox = cells[obj_id].bbox
-        # area = cells[obj_id].area
-        bbox = bboxes[obj_id]
-        
-        label_bbox = segmentation_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
-                                      bbox[1]-pad[1]:bbox[4]+pad[1],
-                                      bbox[2]-pad[2]:bbox[5]+pad[2]]
-        label_img = guide_img_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
-                                  bbox[1]-pad[1]:bbox[4]+pad[1],
-                                  bbox[2]-pad[2]:bbox[5]+pad[2]]
-        
-        # if multilabel_refine:
-        #     label_bbox_refine = usegment3D_filters.diffuse_labels3D(label_bbox*1, 
-        #                                                                 label_img, clamp=refine_clamp,
-        #                                                                 n_iter=refine_iters, # was 25
-        #                                                                 alpha=refine_alpha, # was 0.25
-        #                                                                 noprogress=noprogress_bool,
-        #                                                                 affinity_type=affinity_type)
-        #     label_coords = np.argwhere(label_bbox_refine==cells_id[obj_id]) # has to be the same id. 
-        # else:
-        label_bbox_refine = usegment3D_filters.diffuse_labels3D((label_bbox==cells_id[obj_id])*1, 
-                                                                    label_img, clamp=refine_clamp,
-                                                                    n_iter=refine_iters, # was 25
-                                                                    alpha=refine_alpha, # was 0.25
-                                                                    noprogress=noprogress_bool,
-                                                                    affinity_type=affinity_type)
-        label_coords = np.argwhere(label_bbox_refine>0) # where ever is positive binary 
-        
-        if len(label_coords)>0:
-            label_coords = label_coords + (bbox[:3]-pad[:3])[None,:] # remove the artificial padding. 
-        else:
-            label_coords = [] # empty 
-      
-        # suppress printing. 
-        # print(obj_id)
-        return label_coords
-    
-    """
-    execute the multiprocess
-    """
-    
-    with mp.Pool(n_cpu) as pool: # potentially thread is faster? 
-    #     with mp.Pool(n_procs-1) as pool:
-    # # with ThreadPool(n_procs) as pool: #586 with multiprocess but dask then does work. 
-        res = pool.map(_refine_single_obj, range(0, len(cells)))
-        # res = np.concatenate(res, 1) # collapse all. 
-        # res = res - offset[None,None,:] # subtract the global padding.... everything else shud be fine!. 
-    # remove the offset with broadcasting.
-    
-    """
-    Put back the results into the larger segmentation image. 
-    """
+
+
+# =============================================================================
+# 5. Per-cell refinement: label diffusion and guided filtering
+# =============================================================================
+def _crop_around(img_pad, bbox, pad_size):
+    """Crop a padded image around a (z0,y0,x0,z1,y1,x1) bounding box, extended by pad_size."""
+    return img_pad[
+        bbox[0] - pad_size : bbox[3] + pad_size,
+        bbox[1] - pad_size : bbox[4] + pad_size,
+        bbox[2] - pad_size : bbox[5] + pad_size,
+    ]
+
+
+def _assemble_refined_cells(cell_coords, cells_id, segmentation_pad, pad_size, out_shape):
+    """Paint each cell's refined (padded-image) coordinates with its label, then remove the padding."""
     segmentation_pad_clean = np.zeros_like(segmentation_pad)
-    min_size = 0
-    
-    for res_ii in np.arange(len(res)): 
-        res_cell = res[res_ii]
-        if len(res_cell) > min_size:
-            segmentation_pad_clean[res_cell[:,0], 
-                                    res_cell[:,1], 
-                                    res_cell[:,2]] = cells_id[res_ii]
-    
-    # unpad and return the final segmentation 
-    segmentation_pad_clean = segmentation_pad_clean[padding[0][0]: padding[0][0]+segmentation.shape[0], 
-                                                    padding[1][0]: padding[1][0]+segmentation.shape[1],
-                                                    padding[2][0]: padding[2][0]+segmentation.shape[2]]
-      
-    return segmentation_pad_clean
-    
-     
-def guided_filter_3D_cell_segmentation_MP(segmentation,
-                                          guide_image,
-                                          params):
-    
-    import skimage.measure as skmeasure
-    import skimage.filters as skfilters
-    import skimage.morphology as skmorph
-    import multiprocess as mp 
-    import numpy as np
-    import scipy.ndimage as ndimage 
-    
-    
-    n_cpu = params['guide_filter']['n_cpu']
+
+    for coords, cell_id in zip(cell_coords, cells_id):
+        if len(coords) > 0:
+            segmentation_pad_clean[coords[:, 0], coords[:, 1], coords[:, 2]] = cell_id
+
+    return segmentation_pad_clean[
+        pad_size : pad_size + out_shape[0],
+        pad_size : pad_size + out_shape[1],
+        pad_size : pad_size + out_shape[2],
+    ]
+
+
+def label_diffuse_3D_cell_segmentation_MP(segmentation, guide_image, params):
+    r"""Refine each cell's boundary by label diffusion on an affinity graph built from the guide image.
+
+    Each cell is processed in its own (padded) bounding-box crop, in parallel.
+
+    Parameters
+    ----------
+    segmentation : (Z,Y,X) integer array
+    guide_image : (Z,Y,X) array
+    params : dict
+        as given by segment3D.parameters.get_label_diffusion_params
+
+    Returns
+    -------
+    (Z,Y,X) integer array
+    """
+    n_cpu = params["diffusion"]["n_cpu"]
     if n_cpu is None:
-        n_cpu = np.maximum(mp.cpu_count() - 1,1)
-    
-    # guide_img must be in range 0, 1, enforce here. 
-    guide_img = usegment3D_filters.normalize(guide_image, 
-                                               pmin=params['guide_img']['pmin'], 
-                                               pmax=params['guide_img']['pmax'], clip=True)
-    
-    """
-    Do we do additional ridge filtering? and combine based on the meijering filter? 
-    """
-    if params['ridge_filter']['do_ridge_enhance']:
-        if params['ridge_filter']['do_multiprocess_2D']:
-            n_cpu_ridge = params['ridge_filter']['n_cpu']
-            if n_cpu_ridge is None:
-                n_cpu_ridge = np.maximum(mp.cpu_count()//2 - 1,1)
-                
-            guide_img_edge = usegment3D_filters.meijering_ridge_filter_2D_multiprocess(guide_img, 
-                                                                                       sigmas=params['ridge_filter']['sigmas'], 
-                                                                                       low_contrast_percentile=params['ridge_filter']['low_contrast_fraction'], 
-                                                                                       black_ridges=params['ridge_filter']['black_ridges'], 
-                                                                                       n_cpu=n_cpu_ridge)
-        else:
-            guide_img_edge = skfilters.meijering(guide_img, 
-                                                 sigmas=params['ridge_filter']['sigmas'],
-                                                 black_ridges=params['ridge_filter']['black_ridges'])
-        
-        print(guide_img_edge.shape)
-        # do the mixing
-        guide_img = (1.-params['ridge_filter']['mix_ratio']) * guide_img + (params['ridge_filter']['mix_ratio']) * usegment3D_filters.normalize(guide_img_edge, pmin=params['ridge_filter']['pmin'], pmax=params['ridge_filter']['pmax'], clip=True)
-    
-    
-    """
-    define the parameters upfront
-    """
-    # some setup. 
-    pad_size = params['guide_filter']['pad_size']
-    size_factor = params['guide_filter']['size_factor'] # this scales the radius of the guided filter by this * mean bounding box diameter, increase to recover longer protrusions.
-    
-    use_adaptive_radius = params['guide_filter']['adaptive_radius_bool']
-    min_protrusion_size = params['guide_filter']['min_protrusion_size'] # set this as the minimum protrusion out.
-    mode = params['guide_filter']['mode'] # using additive as cells are empty inside. 
-    base_dilate = params['guide_filter']['base_dilate'] # don't dilate
-    base_erode = params['guide_filter']['base_erode'] # do erode the original (we can increase this to get better erosions if the input is much fatter), but eroding too much may make the segmentation hollow, as it cannot infill.
-    
-    guide_filter_eps = params['guide_filter']['eps'] # lower for more effect without changing radius. 
-    guide_radius = params['guide_filter']['radius']
-    
-    threshold_level=params['guide_filter']['threshold_level'] 
-    n_thresholds= params['guide_filter']['threshold_nlevels']
-    
-    use_int = params['guide_filter']['use_int']
-    
-    """
-    Pad the relevant images
-    """
-    pad = np.hstack([pad_size,pad_size,pad_size])
-    padding = ((pad_size,pad_size), (pad_size,pad_size), (pad_size,pad_size))
-    guide_img_pad = np.pad(guide_img, padding, mode='reflect')
-    segmentation_pad = np.pad(segmentation, padding, mode='constant') # maybe this will be fine!
-    
-    
-    """
-    find individual cell ids
-    """
-    # find out the individual cell ids
+        n_cpu = np.maximum(mp.cpu_count() - 1, 1)
+
+    # guide_img must be in range 0, 1, enforce here.
+    guide_img = usegment3D_filters.normalize(
+        guide_image, pmin=params["guide_img"]["pmin"], pmax=params["guide_img"]["pmax"], clip=True
+    )
+
+    refine_clamp = params["diffusion"]["refine_clamp"]
+    refine_iters = params["diffusion"]["refine_iters"]
+    refine_alpha = params["diffusion"]["refine_alpha"]
+    noprogress_bool = params["diffusion"]["noprogress_bool"]
+    affinity_type = params["diffusion"]["affinity_type"]
+    pad_size = params["diffusion"]["pad_size"]
+
+    padding = ((pad_size, pad_size), (pad_size, pad_size), (pad_size, pad_size))
+    guide_img_pad = np.pad(guide_img, padding, mode="reflect")
+    segmentation_pad = np.pad(segmentation, padding, mode="constant") * 1
+
     cells = skmeasure.regionprops(segmentation_pad)
-    cells_id = np.setdiff1d(np.unique(segmentation_pad), 0 ) # exclude the background label
-    
-    bboxes = [cells[ii].bbox for ii in range(0, len(cells))]
-    
-    """
-    define the internal function
-    """
-    def _refine_single_obj_guidedfilter(obj_id):
-        
-        # bbox = cells[obj_id].bbox
-        # area = cells[obj_id].area
+    cells_id = np.setdiff1d(np.unique(segmentation_pad), 0)  # exclude the background label
+    bboxes = [cell.bbox for cell in cells]
+
+    def _refine_single_obj(obj_id):
         bbox = bboxes[obj_id]
-        
-        label_bbox = segmentation_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
-                                      bbox[1]-pad[1]:bbox[4]+pad[1],
-                                      bbox[2]-pad[2]:bbox[5]+pad[2]]
-        label_img = guide_img_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
-                                  bbox[1]-pad[1]:bbox[4]+pad[1],
-                                  bbox[2]-pad[2]:bbox[5]+pad[2]]
+        label_bbox = _crop_around(segmentation_pad, bbox, pad_size)
+        label_img = _crop_around(guide_img_pad, bbox, pad_size)
+
+        label_bbox_refine = usegment3D_filters.diffuse_labels3D(
+            (label_bbox == cells_id[obj_id]) * 1,
+            label_img,
+            clamp=refine_clamp,
+            n_iter=refine_iters,
+            alpha=refine_alpha,
+            noprogress=noprogress_bool,
+            affinity_type=affinity_type,
+        )
+        label_coords = np.argwhere(label_bbox_refine > 0)
+
+        if len(label_coords) > 0:
+            # crop coordinates -> padded image coordinates.
+            return label_coords + (np.asarray(bbox[:3]) - pad_size)[None, :]
+        return []
+
+    with mp.Pool(n_cpu) as pool:
+        res = pool.map(_refine_single_obj, range(0, len(cells)))
+
+    return _assemble_refined_cells(res, cells_id, segmentation_pad, pad_size, segmentation.shape)
 
 
-        # figure out the mean size. (used if adaptive)        
-        mean_size = np.prod(label_bbox.shape)**(1./3) # this seems better. 
-        # mean_size = (np.sum((label_bbox==cells_id[obj_id])) * 3/ 4. /(np.pi))**(1./3)
-        
-        label_binary = label_bbox == cells_id[obj_id]
-        
-        if use_int:
-            label_binary = label_binary * 1
+def _ridge_enhanced_guide(guide_img, params):
+    """Mix the guide image with its (normalized) Meijering ridge filter response."""
+    ridge = params["ridge_filter"]
+
+    if ridge["do_multiprocess_2D"]:
+        n_cpu_ridge = ridge["n_cpu"]
+        if n_cpu_ridge is None:
+            n_cpu_ridge = np.maximum(mp.cpu_count() // 2 - 1, 1)
+
+        guide_img_edge = usegment3D_filters.meijering_ridge_filter_2D_multiprocess(
+            guide_img,
+            sigmas=ridge["sigmas"],
+            low_contrast_percentile=ridge["low_contrast_fraction"],
+            black_ridges=ridge["black_ridges"],
+            n_cpu=n_cpu_ridge,
+        )
+    else:
+        guide_img_edge = skfilters.meijering(
+            guide_img, sigmas=ridge["sigmas"], black_ridges=ridge["black_ridges"]
+        )
+
+    print(guide_img_edge.shape)
+
+    return (1.0 - ridge["mix_ratio"]) * guide_img + (
+        ridge["mix_ratio"]
+    ) * usegment3D_filters.normalize(
+        guide_img_edge, pmin=ridge["pmin"], pmax=ridge["pmax"], clip=True
+    )
+
+
+def guided_filter_3D_cell_segmentation_MP(segmentation, guide_image, params):
+    r"""Refine each cell (e.g. recover thin protrusions) with a guided filter on the guide image.
+
+    Each cell is processed in its own (padded) bounding-box crop, in parallel.
+
+    Parameters
+    ----------
+    segmentation : (Z,Y,X) integer array
+    guide_image : (Z,Y,X) array
+    params : dict
+        as given by segment3D.parameters.get_guided_filter_params
+
+    Returns
+    -------
+    segmentation_refined : (Z,Y,X) integer array
+    guide_img : the normalized (and optionally ridge-enhanced) guide image used.
+    """
+    gf = params["guide_filter"]
+
+    n_cpu = gf["n_cpu"]
+    if n_cpu is None:
+        n_cpu = np.maximum(mp.cpu_count() - 1, 1)
+
+    # guide_img must be in range 0, 1, enforce here.
+    guide_img = usegment3D_filters.normalize(
+        guide_image, pmin=params["guide_img"]["pmin"], pmax=params["guide_img"]["pmax"], clip=True
+    )
+
+    if params["ridge_filter"]["do_ridge_enhance"]:
+        guide_img = _ridge_enhanced_guide(guide_img, params)
+
+    pad_size = gf["pad_size"]
+    # scales the guided filter radius by this * mean bounding box diameter; increase to recover longer protrusions.
+    size_factor = gf["size_factor"]
+    use_adaptive_radius = gf["adaptive_radius_bool"]
+    min_protrusion_size = gf["min_protrusion_size"]  # the minimum adaptive radius.
+    mode = gf["mode"]  # 'additive' is useful when cells are hollow (membrane marker).
+    base_dilate = gf["base_dilate"]
+    # eroding the input (additive mode) helps if it is too fat, but too much may leave it hollow.
+    base_erode = gf["base_erode"]
+    guide_filter_eps = gf["eps"]  # lower for more effect without changing radius.
+    guide_radius = gf["radius"]
+    threshold_level = gf["threshold_level"]
+    n_thresholds = gf["threshold_nlevels"]
+    use_int = gf["use_int"]
+
+    padding = ((pad_size, pad_size), (pad_size, pad_size), (pad_size, pad_size))
+    guide_img_pad = np.pad(guide_img, padding, mode="reflect")
+    segmentation_pad = np.pad(segmentation, padding, mode="constant")
+
+    cells = skmeasure.regionprops(segmentation_pad)
+    cells_id = np.setdiff1d(np.unique(segmentation_pad), 0)  # exclude the background label
+    bboxes = [cell.bbox for cell in cells]
+
+    def _refine_single_obj_guidedfilter(obj_id):
+        bbox = bboxes[obj_id]
+        label_bbox = _crop_around(segmentation_pad, bbox, pad_size)
+        label_img = _crop_around(guide_img_pad, bbox, pad_size)
+        is_cell = label_bbox == cells_id[obj_id]
+
+        label_binary = is_cell * 1 if use_int else is_cell * 1.0
+
+        if use_adaptive_radius:  # generally better for many heterogeneous cells.
+            mean_size = np.prod(label_bbox.shape) ** (1.0 / 3)
+            radius = np.maximum(min_protrusion_size, mean_size * size_factor)
         else:
-            label_binary = label_binary * 1. 
-        
-       
-        if use_adaptive_radius: # generally better for many heterogeneous cells. 
-            label_bbox_refine_guided = usegment3D_filters.guidedfilter(label_binary, # must be float! 
-                                                              label_img, 
-                                                               radius=np.maximum(min_protrusion_size, mean_size*size_factor),
-                                                              eps=guide_filter_eps)
-        # print(np.max(label_img))
-        else:
-            label_bbox_refine_guided = usegment3D_filters.guidedfilter(label_binary, 
-                                                              label_img, 
-                                                               radius=guide_radius, # use fixed radius
-                                                              eps=guide_filter_eps)
-        
-        label_bbox_refine = label_bbox_refine_guided>=skfilters.threshold_multiotsu(label_bbox_refine_guided, n_thresholds)[threshold_level]
-        
-        # get the largest component! 
-        label_bbox_refine = usegment3D_filters.largest_component_vol(label_bbox_refine) # takes the largest comp
-      
-        if mode == 'additive':
-            base = (label_bbox==cells_id[obj_id]).copy()
-            if base_dilate>0:
+            radius = guide_radius
+
+        label_bbox_refine_guided = usegment3D_filters.guidedfilter(
+            label_binary, label_img, radius=radius, eps=guide_filter_eps
+        )
+
+        # rebinarize and keep the largest component.
+        label_bbox_refine = (
+            label_bbox_refine_guided
+            >= skfilters.threshold_multiotsu(label_bbox_refine_guided, n_thresholds)[
+                threshold_level
+            ]
+        )
+        label_bbox_refine = usegment3D_filters.largest_component_vol(label_bbox_refine)
+
+        if mode == "additive":
+            # add the (optionally dilated or eroded) input cell. Other modes replace it.
+            base = is_cell.copy()
+            if base_dilate > 0:
                 base = skmorph.binary_dilation(base, skmorph.ball(base_dilate))
-            elif base_erode>0:
+            elif base_erode > 0:
                 base = skmorph.binary_erosion(base, skmorph.ball(base_erode))
-            else:
-                pass
-            label_bbox_refine = np.logical_or(label_bbox_refine,
-                                              base)
-        else:
-            # all others do replacement. 
-            pass
-            
-        if params['guide_filter']['collision_erode']>0:
-            # # mask with others. # so we don't go over... 
-            label_bbox_refine = np.logical_or((label_bbox==cells_id[obj_id]), 
-                                              # label_bbox == 0)
-                                              skmorph.binary_erosion(label_bbox == 0, skmorph.ball(params['guide_filter']['collision_erode']))) * label_bbox_refine
-            # label_bbox_refine = np.logical_or((label_bbox==cells_id[obj_id]), 
-            #                                   label_bbox == 0) * label_bbox_refine
-            # label_bbox_refine = grad_filters.largest_component_vol(label_bbox_refine) # takes the largest comp
-            
-        if params['guide_filter']['collision_close']>0:
-            label_bbox_refine = skmorph.binary_closing(label_bbox_refine, skmorph.ball(params['guide_filter']['collision_close'])) # generally ok.
-        if params['guide_filter']['collision_dilate']>0:
-            label_bbox_refine = skmorph.binary_dilation(label_bbox_refine, skmorph.ball(params['guide_filter']['collision_dilate']))
-        if params['guide_filter']['collision_fill_holes']>0:
+            label_bbox_refine = np.logical_or(label_bbox_refine, base)
+
+        if gf["collision_erode"] > 0:
+            # don't grow into other cells.
+            label_bbox_refine = (
+                np.logical_or(
+                    is_cell,
+                    skmorph.binary_erosion(label_bbox == 0, skmorph.ball(gf["collision_erode"])),
+                )
+                * label_bbox_refine
+            )
+        if gf["collision_close"] > 0:
+            label_bbox_refine = skmorph.binary_closing(
+                label_bbox_refine, skmorph.ball(gf["collision_close"])
+            )
+        if gf["collision_dilate"] > 0:
+            label_bbox_refine = skmorph.binary_dilation(
+                label_bbox_refine, skmorph.ball(gf["collision_dilate"])
+            )
+        if gf["collision_fill_holes"] > 0:
             label_bbox_refine = ndimage.binary_fill_holes(label_bbox_refine)
 
-        label_bbox_refine = usegment3D_filters.largest_component_vol(label_bbox_refine) # takes the largest comp
-                    
-        label_coords = np.argwhere(label_bbox_refine>0)
-        
-        if len(label_coords)>0:
-            label_coords = label_coords + (bbox[:3]-pad[:3])[None,:] ### this should be correct.... 
-        
-        # # return old_binary, new_binary, label_coords # just the coords will be good. 
-        # print(obj_id)
-        return label_coords
-    """
-    execute the multiprocess
-    """
-    
-    with mp.Pool(n_cpu) as pool: # potentially thread is faster? 
-    #     with mp.Pool(n_procs-1) as pool:
-    # # with ThreadPool(n_procs) as pool: #586 with multiprocess but dask then does work. 
-        res = pool.map(_refine_single_obj_guidedfilter, range(0, len(cells)))
-        
-    """
-    Put back the results into the larger segmentation image. 
-    """
-    segmentation_pad_clean = np.zeros_like(segmentation_pad)
-    min_size = 0
-    
-    for res_ii in np.arange(len(res)): 
-        res_cell = res[res_ii]
-        if len(res_cell) > min_size:
-            segmentation_pad_clean[res_cell[:,0], 
-                                    res_cell[:,1], 
-                                    res_cell[:,2]] = cells_id[res_ii]
-    
-    # unpad and return the final segmentation 
-    segmentation_pad_clean = segmentation_pad_clean[padding[0][0]: padding[0][0]+segmentation.shape[0], 
-                                                    padding[1][0]: padding[1][0]+segmentation.shape[1],
-                                                    padding[2][0]: padding[2][0]+segmentation.shape[2]]
-      
-    return segmentation_pad_clean, guide_img
-    
+        label_bbox_refine = usegment3D_filters.largest_component_vol(label_bbox_refine)
 
-# this is the multilabel diffusion equivalent for a single binary  ? (is this worth it?)
-# def enhance_3D_binary_segmentation():
-    
-    
-    
-    
-    
-    
-    
-        
-        
-        
+        label_coords = np.argwhere(label_bbox_refine > 0)
+        if len(label_coords) > 0:
+            # crop coordinates -> padded image coordinates.
+            label_coords = label_coords + (np.asarray(bbox[:3]) - pad_size)[None, :]
+
+        return label_coords
+
+    with mp.Pool(n_cpu) as pool:
+        res = pool.map(_refine_single_obj_guidedfilter, range(0, len(cells)))
+
+    segmentation_refined = _assemble_refined_cells(
+        res, cells_id, segmentation_pad, pad_size, segmentation.shape
+    )
+    return segmentation_refined, guide_img
