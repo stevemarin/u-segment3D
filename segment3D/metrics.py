@@ -3,9 +3,16 @@
 Created on Wed Feb 15 03:04:09 2023
 
 @author: fyz11
+
+Segmentation evaluation metrics: semantic IoU / Dice, instance matching, and the
+Cellpose-style average precision and aggregated Jaccard index.
 """
 
 import numpy as np
+import scipy.ndimage as ndimage
+import skimage.measure as skmeasure
+from numba import jit
+from scipy.optimize import linear_sum_assignment
 
 
 def metrics_np(
@@ -147,11 +154,9 @@ def mean_dice_np(y_true, y_pred, **kwargs):
     return metrics_np(y_true, y_pred, metric_name="dice", **kwargs)
 
 
-"""
-functions for 2D cell comparison
-"""
-
-
+# =============================================================================
+# functions for 2D cell comparison
+# =============================================================================
 def _match_cells(labels1, labels2, com1, com2, K=10, bg_label=0):
     """
     labels1 - ground truth
@@ -159,10 +164,10 @@ def _match_cells(labels1, labels2, com1, com2, K=10, bg_label=0):
     com1 - center-of-mass for labels1
     com2 - center-of-mass for labels2
     K - # of nearest neighbor candidates.
+
+    Candidates are the K nearest centroids; pairs are then matched by Hungarian assignment
+    on the IoU. Returns the matched indices with their IoU and Dice, and the IoU matrix.
     """
-    from scipy.optimize import (
-        linear_sum_assignment,
-    )  # brute force is the absolute gold-standard, but can we do this really fast? and without needing to do
     from sklearn.neighbors import NearestNeighbors
 
     uniq1 = np.setdiff1d(np.unique(labels1), bg_label)
@@ -219,16 +224,8 @@ def _match_cells(labels1, labels2, com1, com2, K=10, bg_label=0):
     return ind_i, ind_j, iou_pair, dice_pair, sim_matrix
 
 
-"""
-move to segmentation?
-"""
-
-
 def remove_small_labelled_objects(labels, minsize=64):
-
-    import skimage.measure as skmeasure
-    import numpy as np
-
+    """Set labels with <= minsize pixels to background."""
     unique_label_ = np.setdiff1d(np.unique(labels), 0)
 
     regprops = skmeasure.regionprops(labels)
@@ -248,10 +245,10 @@ def remove_small_labelled_objects(labels, minsize=64):
 def get_valid_eval_region_segmentation(ref, pred, min_coverage=0.01):
     r"""finds the valid connected spatial component to evaluate and compare segmentation between the predicted and reference, setting predicted outside this to background
     0 is assumed to be background label, integers > 0 denote unique segmented instances.
-    """
-    import skimage.measure as skmeasure
-    import numpy as np
 
+    Predicted connected components overlapping the reference foreground by < 1% are removed.
+    Note: the 1% is fixed; min_coverage is not used.
+    """
     # define and evaluate in the correct regions.
     pred_out = pred.copy()
 
@@ -287,12 +284,9 @@ def compute_metrics_cells(
     """
     processes a list of images.
 
+    Returns per image [n_GT, n_Pred, n_match, precision, recall, F1, mean IoU, mean Dice]
+    of the matched cells, and the matching details.
     """
-    from skimage.measure import label
-    from skimage.filters import threshold_otsu
-    import scipy.ndimage as ndimage
-    import pylab as plt
-
     n_images = len(labels_true)
     # based on the overlap we assign and compute the AP based on the segmentations.
     stats = []  # n_GT, n_Pred, n_match, overlap_score.
@@ -306,15 +300,15 @@ def compute_metrics_cells(
         unique_label_pred = np.setdiff1d(np.unique(label_pred), bg_label)
 
         if debug_viz:
+            import pylab as plt
+
             plt.figure()
             plt.imshow(label_pred)
             plt.figure()
             plt.imshow(label_true)
             plt.show(block=False)
 
-        """
-        Use a nearest neighbour type matching to expedite the instance matching. 
-        """
+        # Use a nearest neighbour type matching to expedite the instance matching.
         com_true = ndimage.center_of_mass(
             label_true > 0, labels=label_true, index=unique_label_true
         )
@@ -353,9 +347,7 @@ def compute_metrics_cells(
             "matched_labels_gt_pred": [unique_label_true[gt_i], unique_label_pred[pred_j]],
         }
 
-        """
-        Compute the stats of matching 
-        """
+        # Compute the stats of matching
         n_match = len(pred_j)
         n_GT = len(unique_label_true)
         n_Pred = len(unique_label_pred)
@@ -373,13 +365,9 @@ def compute_metrics_cells(
     return np.vstack(stats), match_props
 
 
-# following taken from cellpose to produce the 'AP' curve which is really the JI curve. ---> it should be modified.
-import numpy as np
-from numba import jit
-from scipy.optimize import linear_sum_assignment
-from scipy.ndimage import convolve, mean
-
-
+# =============================================================================
+# following taken from cellpose to produce the 'AP' curve which is really the JI curve.
+# =============================================================================
 def mask_ious(masks_true, masks_pred):
     """return best-matched masks"""
     iou = _intersection_over_union(masks_true, masks_pred)[1:, 1:]

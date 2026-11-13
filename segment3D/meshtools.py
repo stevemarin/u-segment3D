@@ -1,30 +1,34 @@
-#!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
 Created on Mon Aug  6 13:25:24 2018
 
 @author: felix
 
+Mesh helpers (trimesh).
 """
+
+import numpy as np
+import trimesh
+from skimage.filters import gaussian
+
+
+def _largest_component(mesh):
+    """The connected component of the mesh with the most vertices."""
+    mesh_comps = mesh.split(only_watertight=False)
+    return mesh_comps[np.argmax([len(cc.vertices) for cc in mesh_comps])]
 
 
 def read_mesh(meshfile, process=False, validate=False, keep_largest_only=False):
-
-    import trimesh
-    import numpy as np
-
+    """Load a mesh file, optionally keeping only its largest connected component."""
     mesh = trimesh.load_mesh(meshfile, validate=validate, process=process)
     if keep_largest_only:
-        mesh_comps = mesh.split(only_watertight=False)
-        mesh = mesh_comps[np.argmax([len(cc.vertices) for cc in mesh_comps])]
+        mesh = _largest_component(mesh)
 
     return mesh
 
 
 def create_mesh(vertices, faces, vertex_colors=None, face_colors=None):
-
-    import trimesh
-
+    """Create a trimesh mesh without any processing or validation."""
     mesh = trimesh.Trimesh(
         vertices=vertices,
         faces=faces,
@@ -38,15 +42,11 @@ def create_mesh(vertices, faces, vertex_colors=None, face_colors=None):
 
 
 def marching_cubes_mesh_binary(vol, presmooth=1.0, contourlevel=0.5, keep_largest_only=True):
-
-    from skimage.filters import gaussian
-    import trimesh
-
+    """Mesh the surface of a binary volume (optionally Gaussian presmoothed) with marching cubes."""
     try:
-        from skimage.measure import marching_cubes_lewiner
-    except:
+        from skimage.measure import marching_cubes_lewiner  # scikit-image < 0.19
+    except:  # noqa: E722
         from skimage.measure import marching_cubes
-    import numpy as np
 
     if presmooth is not None:
         img = gaussian(vol, sigma=presmooth, preserve_range=True)
@@ -56,13 +56,12 @@ def marching_cubes_mesh_binary(vol, presmooth=1.0, contourlevel=0.5, keep_larges
 
     try:
         V, F, _, _ = marching_cubes_lewiner(img, level=contourlevel, allow_degenerate=False)
-    except:
+    except:  # noqa: E722
         V, F, _, _ = marching_cubes(img, level=contourlevel, method="lewiner")
     mesh = trimesh.Trimesh(V, F, validate=True)
 
     if keep_largest_only:
-        mesh_comps = mesh.split(only_watertight=False)
-        mesh = mesh_comps[np.argmax([len(cc.vertices) for cc in mesh_comps])]
+        mesh = _largest_component(mesh)
 
     return mesh
 
@@ -104,17 +103,12 @@ def measure_props_trimesh(mesh, main_component=True, clean=True):
         'genus' : scalar
 
     """
-    import trimesh
-    import numpy as np
-
-    # check
-    # make sure we do a split
     if clean:
         mesh_ = trimesh.Trimesh(mesh.vertices, mesh.faces, validate=True, process=True)
     else:
         mesh_ = mesh.copy()
-    mesh_comps = mesh_.split(only_watertight=False)
-    main_mesh = mesh_comps[np.argmax([len(cc.vertices) for cc in mesh_comps])]
+    # note: the largest component is always used, whatever main_component is.
+    main_mesh = _largest_component(mesh_)
 
     props = {}
     props["convex"] = main_mesh.is_convex
