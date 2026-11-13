@@ -61,3 +61,6 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/DanuserLab/u-segment3D"
 Issues = "https://github.com/DanuserLab/u-segment3D/issues"
+
+[tool.ruff]
+line-length = 100
