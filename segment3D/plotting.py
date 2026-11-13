@@ -5,13 +5,16 @@ Created on Tue Feb 21 00:26:42 2023
 @author: fyz11
 """
 
+import numpy as np
 import pylab as plt
+import skimage.color as skcolor
+import skimage.measure as skmeasure
+import skimage.morphology as skmorph
+import skimage.segmentation as sksegmentation
 
 
 def set_axes_equal(ax: plt.Axes):
-
-    import numpy as np
-
+    """Give a 3D plot equal scaling on all axes (a cube around the current limits)."""
     limits = np.array(
         [
             ax.get_xlim3d(),
@@ -35,14 +38,9 @@ def _set_axes_radius(ax, origin, radius):
     return []
 
 
-# this is good.
 def relabel_ground_truth_labels(mask, connectivity=2, minsize=10, reorder=True):
-
-    import skimage.measure as skmeasure
-    import skimage.morphology as skmorph
-    import numpy as np
-
-    # get the labelled regions.
+    """Split each label into connected components (dropping those < minsize) and relabel them,
+    optionally ordered by centroid (row, then column)."""
     uniq_regions = np.setdiff1d(np.unique(mask), 0)
     masks_out = np.zeros_like(mask)
 
@@ -79,9 +77,7 @@ def relabel_ground_truth_labels(mask, connectivity=2, minsize=10, reorder=True):
 
 
 def color_segmentation(labels, cmapname, n_colors=16):
-
-    import skimage.color as skcolor
-    import numpy as np
+    """RGB uint8 image of the labels colored with a seaborn palette (background black)."""
     import seaborn as sns
 
     labels_color = np.uint8(
@@ -99,8 +95,7 @@ def color_segmentation(labels, cmapname, n_colors=16):
 
 
 def get_colors(inp, colormap, vmin=None, vmax=None, bg_label=None):
-    import pylab as plt
-
+    """Map values to colormap colors; values equal to bg_label become black."""
     norm = plt.Normalize(vmin, vmax)
 
     colored = colormap(norm(inp))
@@ -111,10 +106,7 @@ def get_colors(inp, colormap, vmin=None, vmax=None, bg_label=None):
 
 
 def plot_border_tracks_2D(tracks, labels, ax, lw=1, color="magenta", samples=10):
-
-    import skimage.segmentation as sksegmentation
-    import numpy as np
-
+    """Plot a sample of the gradient descent tracks starting on each cell's border."""
     uniq_regions = np.setdiff1d(np.unique(labels), 0)
 
     # get the border annotation.
@@ -132,7 +124,7 @@ def plot_border_tracks_2D(tracks, labels, ax, lw=1, color="magenta", samples=10)
     ax.imshow(blank_color)
 
     for rr in uniq_regions:
-        select = np.logical_and(lab_tracks == rr, border_tracks == True)
+        select = np.logical_and(lab_tracks == rr, border_tracks)
 
         tracks_select = tracks[:, select > 0].copy()
 

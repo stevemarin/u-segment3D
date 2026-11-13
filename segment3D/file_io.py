@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+Reading and writing images, pickles and segmentations.
+"""
+
+import os
+import pickle
+
+import numpy as np
+import skimage.io as skio
+
+
 def read_czifile(czi_file, squeeze=True):
     r"""Reads the data of a simple .czi microscope stack into a numpy array using the lightweight czifile library
 
@@ -14,7 +26,6 @@ def read_czifile(czi_file, squeeze=True):
         image stored in the .czi
 
     """
-    import numpy as np
     from czifile import CziFile
 
     with CziFile(czi_file) as czi:
@@ -34,9 +45,6 @@ def mkdir(directory):
         path of the folder to create
 
     """
-
-    import os
-
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -52,16 +60,12 @@ def read_pickle(filename):
         absolute path of the file to read
 
     """
-    import pickle
-
     with open(filename, "rb") as output:
         return pickle.load(output)
 
 
 def write_pickle(savepicklefile, savedict):
-
-    import pickle
-
+    r"""write savedict to a python3 pickled .pkl file"""
     with open(savepicklefile, "wb") as handle:
         pickle.dump(savedict, handle)
 
@@ -69,11 +73,9 @@ def write_pickle(savepicklefile, savedict):
 
 
 def save_segmentation(fname, labels, cmapname="Spectral", n_colors=16):
-
-    import skimage.color as skcolor
-    import numpy as np
-    import seaborn as sns
-    import skimage.io as skio
+    r"""Save labels to fname (a .tif path) as '<name>_labels.tif' (uint16, or uint32 if needed)
+    and a colored version as '<name>_labels-RGB.tif'."""
+    from .plotting import color_segmentation
 
     # check whether uint16 or uint32
     if np.max(labels) > 65535:
@@ -81,16 +83,7 @@ def save_segmentation(fname, labels, cmapname="Spectral", n_colors=16):
     else:
         skio.imsave(fname.replace(".tif", "_labels.tif"), np.uint16(labels))
 
-    labels_color = np.uint8(
-        255
-        * skcolor.label2rgb(
-            labels,
-            colors=sns.color_palette(
-                cmapname, n_colors=n_colors
-            ),  # spectral is a nicer colorscheme.
-            bg_label=0,
-        )
-    )
+    labels_color = color_segmentation(labels, cmapname, n_colors=n_colors)
 
     skio.imsave(fname.replace(".tif", "_labels-RGB.tif"), labels_color)
 
