@@ -163,21 +163,11 @@ def connected_components_pts_3D( pts, pts0, shape,
     else:
         votes_grid_binary = votes_grid_acc > np.mean(votes_grid_acc) # just threshold over the mean. 
         
-    # cell_seg_connected = skmeasure.label(votes_grid_binary, connectivity=2) # use the full conditional 
     cell_seg_connected = cc3d.connected_components(votes_grid_binary)
     
     # # we don't need this bit. 
-    # cell_uniq_regions = np.setdiff1d(np.unique(cell_seg_connected),0)
-    # if len(cell_uniq_regions)>0:
-    #     props = skmeasure.regionprops(cell_seg_connected)
-    #     areas = np.hstack([re.area for re in props])
-    #     invalid_areas = cell_uniq_regions[areas<=min_area]
     
-    #     for invalid in invalid_areas:
-    #         cell_seg_connected[cell_seg_connected==invalid] = 0
         
-    # if cell_seg_connected.max() > 0:
-    #     cell_seg_connected = sksegmentation.relabel_sequential(cell_seg_connected)[0]
     
     cell_seg_connected_original = np.zeros_like(cell_seg_connected)
     cell_seg_connected_original[(pts0[:,0]).astype(np.int32), 
@@ -197,16 +187,11 @@ def _sdf_distance_transform(binary, rev_sign=True):
     
     import numpy as np 
     from scipy.ndimage import distance_transform_edt
-    # import skfmm
-    # import GeodisTK
     
     pos_binary = binary.copy()
     neg_binary = np.logical_not(pos_binary)
     
     res = distance_transform_edt(neg_binary) * neg_binary - (distance_transform_edt(pos_binary) - 1) * pos_binary
-    # res = skfmm.distance(neg_binary, dx=0.5) * neg_binary - (skfmm.distance(pos_binary, dx=0.5) - 1) * pos_binary
-    # res = skfmm.distance(neg_binary) * neg_binary - (skfmm.distance(pos_binary) - 1) * pos_binary # this was fast!. 
-    # res = geodesic_distance_2d((neg_binary*1.).astype(np.float32), S=neg_binary, lamb=0.8, iter=10) * neg_binary - (geodesic_distance_2d((pos_binary*1.).astype(np.float32), S=neg_binary, lamb=0.5, iter=10) - 1) * pos_binary
     
     if rev_sign:
         res = res * -1
@@ -338,12 +323,10 @@ def gradient_watershed2D_binary(binary,
         sdf_normals = sdf_normals * curvature_2D[None,...] # multiplicative factor rescaling 
         
         
-    # print(sdf_normals.shape)
     grid =  np.zeros(binary.shape, dtype=np.int32)
     pts = np.argwhere(binary>0) # (N,ndim)
     
     mu = momenta # momentum
-    # g0 = np.zeros(pts.shape)
     g0 = np.zeros_like(pts)
     
     tracks = [pts]
@@ -357,7 +340,6 @@ def gradient_watershed2D_binary(binary,
             pts_vect_ii = sdf_normals[:,np.rint(pt_ii[:,0]).astype(np.int32), np.rint(pt_ii[:,1]).astype(np.int32)].T
         
         pts_vect_ii = pts_vect_ii / (np.linalg.norm(pts_vect_ii, axis=-1)[:,None] + eps)
-        # pt_ii_next = pt_ii + delta*pts_vect_ii
         pt_ii_next = pt_ii + (delta*pts_vect_ii + mu*g0) * (1./(delta+mu))   * (delta/(1.+ii*gradient_decay)) # add momentum + connectivity. 
         g0 = pts_vect_ii.copy() # copy this into the past history....     
         
@@ -466,7 +448,6 @@ def gradient_watershed3D_binary(binary,
     import skimage.measure as skmeasure 
     import skimage.segmentation as sksegmentation 
     from tqdm import tqdm 
-    #from .plotting import set_axes_equal
     import importlib
     plotting = importlib.import_module(f"{__package__}.plotting")
     set_axes_equal = plotting.set_axes_equal
@@ -505,9 +486,7 @@ def gradient_watershed3D_binary(binary,
         curvature_3D = _normalize99(curvature_3D, lower=0.01,upper=99) # rescales to a factor between 0-1
         sdf_normals = sdf_normals * curvature_3D[None,...] # multiplicative factor rescaling 
     
-    # grid =  np.zeros(binary.shape, dtype=np.int32)
     pts = np.argwhere(binary>0).astype(np.float32) # (N,ndim)
-    # pt_ii = np.argwhere(binary>0).astype(np.float32)
     pt_ii = pts.copy()
     
     
@@ -516,7 +495,6 @@ def gradient_watershed3D_binary(binary,
     if track_percent > 0:
         np.random.seed(rand_seed)
         n_samples_track = int(track_percent*len(pts))
-        # n_samples_track = len(pts)
         select_pts_track = np.arange(len(pts)) #[::1000]
         np.random.shuffle(select_pts_track)
         
@@ -525,19 +503,12 @@ def gradient_watershed3D_binary(binary,
         
 
     mu = momenta # momentum
-    # g0 = np.zeros(pts.shape)
     g0 = np.zeros_like(pt_ii)
     
-    # delta_position_changes = []
     
-    # if use_connectivity:
-    #     import point_cloud_utils as pcu 
-    #     _, W = pcu.k_nearest_neighbors(pts, pts, k=5)
-    #     alpha=connectivity_alpha
     
     
     for ii in tqdm(np.arange(n_iter)):
-        # pt_ii = tracks[-1].copy()
         
         """
         interp helps!. 
@@ -545,10 +516,6 @@ def gradient_watershed3D_binary(binary,
         if interp:
             pts_vect_ii = np.array([_interp3(pt_ii, binary.shape, I_ref=sdf_normals[ch], method='linear', cast_uint8=False) for ch in np.arange(len(sdf_normals))]).T
         else:
-            # print('no interp')
-            # pts_vect_ii = sdf_normals[:,
-            #                           pt_ii[...,0].astype(np.int32), 
-            #                           pt_ii[...,1].astype(np.int32), 
             #                           pt_ii[...,2].astype(np.int32)].T  # direct lookup - not interp!. 
             # faster index with flat indices? 
             pts_vect_ii = (sdf_normals.reshape(3,-1)[:,np.ravel_multi_index(pt_ii.astype(np.int32).T, sdf_normals.shape[1:], mode='raise', order='C')]).T
@@ -557,17 +524,14 @@ def gradient_watershed3D_binary(binary,
         # renormalize
         if renorm_gradient:
             pts_vect_ii = pts_vect_ii / (np.linalg.norm(pts_vect_ii, axis=-1)[:,None] + 1e-20)
-            # pts_vect_ii = pts_vect_ii / (np.sqrt(np.sum(pts_vect_ii**2, axis=-1))[:,None] + 1e-20)
             
         """
         Update step:
         """
         if use_connectivity:
             pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * W.dot(pts_vect_ii) # twice
-            # pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * np.nanmean(pts_vect_ii[W], axis=1)
             
         # else:
-        # pt_ii_next = pt_ii + delta*pts_vect_ii
         pt_ii_next = pt_ii + (delta*pts_vect_ii + mu*g0) * (1./(delta+mu))  * (delta/(1.+ii*gradient_decay))# add momentum + connectivity. 
         
         g0 = pts_vect_ii.copy() # copy this into the past history.... 
@@ -576,22 +540,13 @@ def gradient_watershed3D_binary(binary,
         pt_ii_next[:,1] = np.clip(pt_ii_next[:,1], 0, binary.shape[1]-1)
         pt_ii_next[:,2] = np.clip(pt_ii_next[:,2], 0, binary.shape[2]-1)
         
-        # delta_change = np.nanmean(np.linalg.norm(pt_ii_next-pt_ii, axis=-1)) # mean or median?  # this can help with early stopping!. 
-        # delta_position_changes.append(delta_change)
-        # print(delta_change)
         
-        # tracks[-1] = pt_ii_next # overwrite 
         pt_ii = pt_ii_next
         
         if track_percent > 0:
-            # print(select_pts_track.shape)
             tracks.append(pt_ii_next[select_pts_track,:])
         
-        # plt.figure(figsize=(10,10))
-        # plt.imshow(binary.max(axis=0))
         # plt.plot(pt_ii_next[:,2], 
-        #          pt_ii_next[:,1], 'r.')
-        # plt.show(block=False)
         
         if debug_viz:
             
@@ -601,15 +556,11 @@ def gradient_watershed3D_binary(binary,
                                                       pts[::sampling, 2].astype(np.int32)].copy()
                 
             
-            # sampling = 1000
             fig = plt.figure(figsize=(10,10))
             ax = fig.add_subplot(111, projection='3d')
             ax.set_proj_type('ortho') # this works better!.
             ax.set_box_aspect(aspect = (1,1,1)) # this works. 
             # ax.scatter(v_watertight[::sampling,0], 
-            #             v_watertight[::sampling,1], 
-            #             v_watertight[::sampling,2], 
-            #             c='k', s=1, alpha=0.0)#all_labels_branches[np.squeeze(all_dists)<20], s=1)
             
             if ref_initial_color_img is not None:
                 ax.scatter(pts[::sampling, 0], 
@@ -625,24 +576,11 @@ def gradient_watershed3D_binary(binary,
             ax.scatter(pt_ii_next[::sampling,0], 
                        pt_ii_next[::sampling,1],
                         pt_ii_next[::sampling,2], c='magenta',s=1, zorder=1000)
-                        # pt_ii_next[::sampling,2], c='magenta',s=1)
             
             # ax.scatter(centroids3D_from_xz[:,0], 
-            #            centroids3D_from_xz[:,1],
-            #            centroids3D_from_xz[:,2], c='g',s=10)
             # ax.scatter(centroids3D_from_yz[:,0], 
-            #            centroids3D_from_yz[:,1],
-            #            centroids3D_from_yz[:,2], c='b',s=10)
             # # ax.scatter(skel3D_coords[:,0], 
-            # #             skel3D_coords[:,1],
-            # #             skel3D_coords[:,2], c='k',s=5, alpha=1)
-            # ax.view_init(-90,0)
-            # ax.view_init(0,180)
             ax.view_init(viewinit[0], viewinit[1])
-            # ax.view_init(180,0)
-            # ax.set_xlim([0,binary.shape[0]]) # why is this plot not good? 
-            # ax.set_ylim([0,binary.shape[1]])
-            # ax.set_zlim([0,binary.shape[2]])
             set_axes_equal(ax)
             
             if saveplotsfolder is not None:
@@ -662,61 +600,30 @@ def gradient_watershed3D_binary(binary,
 # =============================================================================
     if len(tracks) > 0:
         tracks = np.array(tracks)
-    # # tracks = pt_ii
     
     # # parse ... 
-    # votes_grid_acc = np.zeros(binary.shape)
     # # votes_grid_acc[(tracks[-1][:,0]).astype(np.int32), 
-    # #                (tracks[-1][:,1]).astype(np.int32),
     # #                (tracks[-1][:,2]).astype(np.int32)] += 1. # add a vote. 
     # votes_grid_acc[(pt_ii[:,0]).astype(np.int32), 
-    #                (pt_ii[:,1]).astype(np.int32),
     #                (pt_ii[:,2]).astype(np.int32)] += 1. # add a vote. 
                    
     # # smooth to get a density (fast KDE estimation)
-    # votes_grid_acc = ndimage.gaussian_filter(votes_grid_acc, sigma=smooth_sigma)   # gaussian or uniform? 
     
-    # if thresh_factor is not None:
-    #     if mask is not None:
-    #         votes_grid_binary = votes_grid_acc >np.mean(votes_grid_acc[mask]) + thresh_factor*np.std(votes_grid_acc[mask])
     #     else:
-    #         votes_grid_binary = votes_grid_acc >np.mean(votes_grid_acc) + thresh_factor*np.std(votes_grid_acc)
     # else:
-    #     votes_grid_binary = votes_grid_acc > np.mean(votes_grid_acc) # just threshold over the mean. 
         
-    # cell_seg_connected = skmeasure.label(votes_grid_binary, connectivity=2)
-    # cell_uniq_regions = np.setdiff1d(np.unique(cell_seg_connected),0)
-    # if len(cell_uniq_regions)>0:
-    #     props = skmeasure.regionprops(cell_seg_connected)
-    #     areas = np.hstack([re.area for re in props])
-    #     invalid_areas = cell_uniq_regions[areas<=min_area]
     
-    #     for invalid in invalid_areas:
-    #         cell_seg_connected[cell_seg_connected==invalid] = 0
         
-    # if cell_seg_connected.max() > 0:
-    #     cell_seg_connected = sksegmentation.relabel_sequential(cell_seg_connected)[0]
     
     
-    # cell_seg_connected_original = np.zeros_like(cell_seg_connected)
     # # cell_seg_connected_original[(pts[:,0]).astype(np.int32), 
-    # #                             (pts[:,1]).astype(np.int32),
     # #                             (pts[:,2]).astype(np.int32)] = cell_seg_connected[(tracks[-1][:,0]).astype(np.int32), 
-    # #                                                                               (tracks[-1][:,1]).astype(np.int32),
     # #                                                                               (tracks[-1][:,2]).astype(np.int32)]                                  
     # cell_seg_connected_original[(pts[:,0]).astype(np.int32), 
-    #                             (pts[:,1]).astype(np.int32),
     #                             (pts[:,2]).astype(np.int32)] = cell_seg_connected[(pt_ii[:,0]).astype(np.int32), 
-    #                                                                               (pt_ii[:,1]).astype(np.int32),
     #                                                                               (pt_ii[:,2]).astype(np.int32)]                                  
     
     # cell_seg_connected_original, cell_seg_connected, votes_grid_acc = connected_components_pts_3D( pts=tracks[-1], 
-    #                                                                                                 pts0=pts, 
-    #                                                                                                 shape=binary.shape[:3], 
-    #                                                                                                 smooth_sigma=smooth_sigma, 
-    #                                                                                                 thresh_factor=thresh_factor, 
-    #                                                                                                 mask=mask,
-    #                                                                                                 min_area=min_area)
     cell_seg_connected_original, cell_seg_connected, votes_grid_acc = connected_components_pts_3D( pts=pt_ii, 
                                                                                                     pts0=pts, 
                                                                                                     shape=binary.shape[:3], 
@@ -725,7 +632,6 @@ def gradient_watershed3D_binary(binary,
                                                                                                     mask=mask,
                                                                                                     min_area=min_area)
     
-    # return cell_seg_connected_original, cell_seg_connected, tracks, votes_grid_acc
     return cell_seg_connected_original, cell_seg_connected, tracks, votes_grid_acc
 
 
@@ -802,7 +708,6 @@ def gradient_watershed3D_binary_dynamics(binary,
     import skimage.measure as skmeasure 
     import skimage.segmentation as sksegmentation 
     from tqdm import tqdm 
-    #from .plotting import set_axes_equal
     import importlib
     plotting = importlib.import_module(f"{__package__}.plotting")
     set_axes_equal = plotting.set_axes_equal
@@ -842,14 +747,10 @@ def gradient_watershed3D_binary_dynamics(binary,
         curvature_3D = _normalize99(curvature_3D, lower=0.01,upper=99) # rescales to a factor between 0-1
         sdf_normals = sdf_normals * curvature_3D[None,...] # multiplicative factor rescaling 
     
-    # grid =  np.zeros(binary.shape, dtype=np.int32)
     pts = np.argwhere(binary>0).astype(np.float32) # (N,ndim)
-    # pt_ii = np.argwhere(binary>0).astype(np.float32)
     pt_ii = pts.copy()
     
-    # tracks = [pts]
     mu = momenta # momentum
-    # g0 = np.zeros(pts.shape)
     g0 = np.zeros_like(pt_ii)
     
     
@@ -861,10 +762,6 @@ def gradient_watershed3D_binary_dynamics(binary,
         if interp:
             pts_vect_ii = np.array([_interp3(pt_ii, binary.shape, I_ref=sdf_normals[ch], method='linear', cast_uint8=False) for ch in np.arange(len(sdf_normals))]).T
         else:
-            # print('no interp')
-            # pts_vect_ii = sdf_normals[:,
-            #                           pt_ii[...,0].astype(np.int32), 
-            #                           pt_ii[...,1].astype(np.int32), 
             #                           pt_ii[...,2].astype(np.int32)].T  # direct lookup - not interp!. 
             # faster index with flat indices? 
             pts_vect_ii = (sdf_normals.reshape(3,-1)[:,np.ravel_multi_index(pt_ii.astype(np.int32).T, sdf_normals.shape[1:], mode='raise', order='C')]).T
@@ -880,11 +777,8 @@ def gradient_watershed3D_binary_dynamics(binary,
         """
         if use_connectivity:
             pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * W.dot(pts_vect_ii) # twice
-            # pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * np.nanmean(pts_vect_ii[W], axis=1)
             
         # else:
-        # pt_ii_next = pt_ii + delta*pts_vect_ii
-        # pt_ii_next = pt_ii + (delta*pts_vect_ii + mu*g0) * (1./(delta+mu))  # add momentum + connectivity. 
         pt_ii_next = pt_ii + (delta*pts_vect_ii + mu*g0) * (1./(delta+mu))  * (delta/(1.+ii*gradient_decay))# add momentum + connectivity. 
         g0 = pts_vect_ii.copy() # copy this into the past history.... 
         
@@ -892,18 +786,10 @@ def gradient_watershed3D_binary_dynamics(binary,
         pt_ii_next[:,1] = np.clip(pt_ii_next[:,1], 0, binary.shape[1]-1)
         pt_ii_next[:,2] = np.clip(pt_ii_next[:,2], 0, binary.shape[2]-1)
         
-        # delta_change = np.nanmean(np.linalg.norm(pt_ii_next-pt_ii, axis=-1)) # mean or median?  # this can help with early stopping!. 
-        # delta_position_changes.append(delta_change)
-        # print(delta_change)
         
-        # tracks[-1] = pt_ii_next # overwrite 
         pt_ii = pt_ii_next
         
-        # plt.figure(figsize=(10,10))
-        # plt.imshow(binary.max(axis=0))
         # plt.plot(pt_ii_next[:,2], 
-        #          pt_ii_next[:,1], 'r.')
-        # plt.show(block=False)
         
         if debug_viz:
             sampling = 1000
@@ -912,31 +798,16 @@ def gradient_watershed3D_binary_dynamics(binary,
             ax.set_proj_type('ortho') # this works better!.
             ax.set_box_aspect(aspect = (1,1,1)) # this works. 
             # ax.scatter(v_watertight[::sampling,0], 
-            #             v_watertight[::sampling,1], 
-            #             v_watertight[::sampling,2], 
-            #             c='k', s=1, alpha=0.0)#all_labels_branches[np.squeeze(all_dists)<20], s=1)
             ax.scatter(pt_ii_next[::sampling,0], 
                        pt_ii_next[::sampling,1],
                        pt_ii_next[::sampling,2], c='r',s=1)
             # ax.scatter(centroids3D_from_xz[:,0], 
-            #            centroids3D_from_xz[:,1],
-            #            centroids3D_from_xz[:,2], c='g',s=10)
             # ax.scatter(centroids3D_from_yz[:,0], 
-            #            centroids3D_from_yz[:,1],
-            #            centroids3D_from_yz[:,2], c='b',s=10)
             # # ax.scatter(skel3D_coords[:,0], 
-            # #             skel3D_coords[:,1],
-            # #             skel3D_coords[:,2], c='k',s=5, alpha=1)
-            # ax.view_init(-90,0)
             ax.view_init(0,180)
-            # ax.view_init(180,0)
-            # ax.set_xlim([0,binary.shape[0]]) # why is this plot not good? 
-            # ax.set_ylim([0,binary.shape[1]])
-            # ax.set_zlim([0,binary.shape[2]])
             set_axes_equal(ax)
             plt.show(block=False)
             
-    # print(ii)
     return np.concatenate([pts[None,...], pt_ii[None,...]], axis=0) # return the initial and final position!. 
 
 
@@ -973,12 +844,10 @@ def mp_gradient_watershed3D_binary(binary,
     if tile_shape is None:
         # do autoinfer. 
         total_vol = np.prod(binary.shape[:3])
-        # per_vol = total_vol / (n_procs /(1.+tile_overlap_ratio))
         per_vol = total_vol / n_procs #/2. # assume we have less!. 
         
         # not sure the division is correct.
         tile_shape = tuple(np.int32(np.hstack( (per_vol / (float(np.sum(tile_aspect))))**(1./3) * np.hstack(tile_aspect))))
-        # tile_shape = tuple(np.int32(np.hstack((total_vol/(n_procs/(1.)))/ (float(np.sum(tile_aspect))) * np.hstack(tile_aspect))))
         
         smallest_ind = np.argmin(binary.shape)
         max_correction_factor = np.int32(np.ceil(binary.shape[smallest_ind] / tile_shape[smallest_ind]))
@@ -991,7 +860,6 @@ def mp_gradient_watershed3D_binary(binary,
                     overlap=overlap #, # maintain approx 10%
                     )
         correction_factor = (tiler.n_tiles*1./tile_overlap_ratio/n_procs)**(1./3)
-        # print(correction_factor)
         correction_factor = np.minimum( correction_factor, max_correction_factor)
         tile_shape = tuple(np.int32(np.hstack(tile_shape) * correction_factor))
         
@@ -1014,7 +882,6 @@ def mp_gradient_watershed3D_binary(binary,
 
     offset = np.hstack([p[0] for p in padding])
     tiler.recalculate(data_shape=new_shape)
-    # padded_volume = np.pad(volume, padding, mode="reflect")
     
     shape = binary.shape
     
@@ -1052,7 +919,6 @@ def mp_gradient_watershed3D_binary(binary,
                                                             eps=eps, 
                                                             min_area=min_area,
                                                             thresh_factor=None,
-                                                            # mask=im_binary,
                                                             use_connectivity=use_connectivity,
                                                             connectivity_alpha=connectivity_alpha,
                                                             renorm_gradient=renorm_gradient,
@@ -1065,7 +931,6 @@ def mp_gradient_watershed3D_binary(binary,
             # # trunk out the overlapping region 
             keep = np.ones(res[0].shape[:1], dtype=bool)
             # also remove those that didn't move a lot
-            # keep = np.linalg.norm(res[0]-res[1], axis=-1) > 2 # no point keeping fixed points. # they should all move
             print('Tile id', tile_id, len(keep), np.sum(keep))
             
             for dim in np.arange(res.shape[-1]):
@@ -1074,7 +939,6 @@ def mp_gradient_watershed3D_binary(binary,
                                                       res[0,...,dim] < size[dim]-overlap[dim]//2)) # only keep 
             
             # # use broadcasting
-            # keep = np.logical_and( res[0]>= (overlap//2)[None,:], res[0] < (size - overlap//2)[None,:])
             
             res = res[:,keep>0] + np.hstack(bbox_low)[None,None,:] # then add back the coordinate axis. 
         return res
@@ -1083,11 +947,9 @@ def mp_gradient_watershed3D_binary(binary,
     import time 
     t1 = time.time()
     
-    # with mp.Pool(n_procs) as pool:
     with ThreadPool(n_procs) as pool: 
         res = pool.map(_run_dynamics, range(0, tiler.n_tiles)) # why is this runnin more than expected? 
         res = np.concatenate(res, 1) # collapse all. 
-        # res = np.concatenate([result.get() for result in res], axis=1)
         res = res - offset[None,None,:] # subtract the global padding.... everything else shud be fine!. 
     
     t2 = time.time()
@@ -1115,21 +977,6 @@ def mp_gradient_watershed3D_binary(binary,
     return cell_seg_connected_original, cell_seg_connected, res[1], votes_grid_acc
 
 # def gradient_watershed3D_binary_mp(binary, 
-#                                 gradient_img=None, 
-#                                 momenta = 0.75,
-#                                 divergence_rescale=True, 
-#                                 smooth_sigma=1, 
-#                                 smooth_gradient=1, 
-#                                 delta=1, 
-#                                 n_iter=100, 
-#                                 min_area=5, 
-#                                 eps=1e-12, 
-#                                 thresh_factor=None, 
-#                                 mask=None,
-#                                 interp=False,
-#                                 use_connectivity=False, 
-#                                 connectivity_alpha = 0.5,
-#                                 debug_viz=False,
 #                                 renorm_gradient=True):
     
 #     """ parses the instance level segmentation implicitly given as an input binary or a vector field. 
@@ -1170,182 +1017,68 @@ def mp_gradient_watershed3D_binary(binary,
         
 #     Returns
 #     -------
-#     cell_seg_connected_original : (MxNxL)
 #         an integer image where each unique int > 0 relates to a unique object such that object 1 is retrieved by cell_seg_connected_original==1.
         
 #     """
     
-#     import scipy.ndimage as ndimage
-#     import numpy as np 
-#     import skimage.morphology as skmorph
-#     import pylab as plt 
-#     import skimage.measure as skmeasure 
-#     import skimage.segmentation as sksegmentation 
-#     from tqdm import tqdm 
-#     from .plotting import set_axes_equal
-#     import multiprocess as mp
-    
-#     n_cpu = mp.cpu_count() - 1
     
     
-#     if gradient_img is not None:
-#         sdf_normals = gradient_img.transpose(3,0,1,2) # use the supplied gradients! 
-#         sdf_normals = sdf_normals * binary[None,...]
+    
 #     else:
 #         # compute the signed distance transform
-#         sdf_normals, sdf_binary = surf_normal_sdf(binary, return_sdf=True, smooth_gradient=smooth_gradient, eps=eps, norm_vectors=True)
-#         sdf_normals = sdf_normals * binary[None,...]
     
     
-#     if use_connectivity:
-#         from sklearn.feature_extraction.image import grid_to_graph
-#         import scipy.sparse as spsparse 
         
-#         W = grid_to_graph(binary.shape[0], 
-#                         binary.shape[1],
-#                         binary.shape[2], 
 #                         mask=binary>0)  # convert this to laplacian.   
     
 #         # create the averaging matrix 
-#         DD = 1./(W.sum(axis=-1))
-#         DD = spsparse.spdiags(np.squeeze(DD), [0], DD.shape[0], DD.shape[0]) 
-#         W = DD.dot(W) # averaging
-#         del DD # some memory management. 
         
-#         alpha=connectivity_alpha
         
-#     if divergence_rescale:
 #         # rescale the speed
-#         curvature_3D = mean_curvature_sdf(sdf_normals)
-#         curvature_3D = _normalize99(curvature_3D, lower=0.01,upper=99) # rescales to a factor between 0-1
-#         sdf_normals = sdf_normals * curvature_3D[None,...] # multiplicative factor rescaling 
-    
-#     # grid =  np.zeros(binary.shape, dtype=np.int32)
-#     pts = np.argwhere(binary>0).astype(np.float32) # (N,ndim)
-#     # pt_ii = np.argwhere(binary>0).astype(np.float32)
-#     pt_ii = pts.copy()
-    
-#     # tracks = [pts]
-#     mu = momenta # momentum
-#     # g0 = np.zeros(pts.shape)
-#     g0 = np.zeros_like(pt_ii)
-    
-#     # delta_position_changes = []
-    
-#     # if use_connectivity:
-#     #     import point_cloud_utils as pcu 
-#     #     _, W = pcu.k_nearest_neighbors(pts, pts, k=5)
-#     #     alpha=connectivity_alpha
     
     
-#     for ii in tqdm(np.arange(n_iter)):
-#         # pt_ii = tracks[-1].copy()
+    
+    
+    
+    
         
 #         """
 #         interp helps!. 
 #         """
-#         if interp:
-#             pts_vect_ii = np.array([_interp3(pt_ii, binary.shape, I_ref=sdf_normals[ch], method='linear', cast_uint8=False) for ch in np.arange(len(sdf_normals))]).T
 #         else:
-#             # print('no interp')
-#             # pts_vect_ii = sdf_normals[:,
-#             #                           pt_ii[...,0].astype(np.int32), 
-#             #                           pt_ii[...,1].astype(np.int32), 
 #             #                           pt_ii[...,2].astype(np.int32)].T  # direct lookup - not interp!. 
 #             # faster index with flat indices? 
-#             pts_vect_ii = (sdf_normals.reshape(3,-1)[:,np.ravel_multi_index(pt_ii.astype(np.int32).T, sdf_normals.shape[1:], mode='raise', order='C')]).T
             
             
 #         # renormalize
-#         if renorm_gradient:
-#             pts_vect_ii = pts_vect_ii / (np.linalg.norm(pts_vect_ii, axis=-1)[:,None] + 1e-20)
-#             # pts_vect_ii = pts_vect_ii / (np.sqrt(np.sum(pts_vect_ii**2, axis=-1))[:,None] + 1e-20)
             
 #         """
 #         Update step:
 #         """
-#         if use_connectivity:
-#             pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * W.dot(pts_vect_ii) # twice
-#             # pts_vect_ii = alpha * pts_vect_ii + (1-alpha) * np.nanmean(pts_vect_ii[W], axis=1)
             
 #         # # else:
-#         # # pt_ii_next = pt_ii + delta*pts_vect_ii
-#         pt_ii_next = pt_ii + (delta*pts_vect_ii + mu*g0) * (1./(delta+mu))  # add momentum + connectivity. 
         
-#         # pt_ii_ids = np.array_split(np.arange(len(pt_ii)), n_cpu)
         
-#         # def mp_sum(ids):
-#         #     pp = pt_ii[ids] + (delta*pts_vect_ii[ids] + mu*g0[ids]) * (1./(delta+mu)) 
-#         #     return pp
         
-#         # with mp.Pool() as pool:
-#         #     pt_ii_next = pool.map(mp_sum, pt_ii_ids)
-#         #     pt_ii_next = np.vstack(pt_ii_next)
         
-#         g0 = pts_vect_ii.copy() # copy this into the past history.... 
         
-#         pt_ii_next[:,0] = np.clip(pt_ii_next[:,0], 0, binary.shape[0]-1)
-#         pt_ii_next[:,1] = np.clip(pt_ii_next[:,1], 0, binary.shape[1]-1)
-#         pt_ii_next[:,2] = np.clip(pt_ii_next[:,2], 0, binary.shape[2]-1)
         
-#         # delta_change = np.nanmean(np.linalg.norm(pt_ii_next-pt_ii, axis=-1)) # mean or median?  # this can help with early stopping!. 
-#         # delta_position_changes.append(delta_change)
-#         # print(delta_change)
         
-#         # tracks[-1] = pt_ii_next # overwrite 
-#         pt_ii = pt_ii_next
         
-#         # plt.figure(figsize=(10,10))
-#         # plt.imshow(binary.max(axis=0))
 #         # plt.plot(pt_ii_next[:,2], 
-#         #          pt_ii_next[:,1], 'r.')
-#         # plt.show(block=False)
         
-#         if debug_viz:
-#             sampling = 1000
-#             fig = plt.figure(figsize=(10,10))
-#             ax = fig.add_subplot(111, projection='3d')
-#             ax.set_proj_type('ortho') # this works better!.
-#             ax.set_box_aspect(aspect = (1,1,1)) # this works. 
 #             # ax.scatter(v_watertight[::sampling,0], 
-#             #             v_watertight[::sampling,1], 
-#             #             v_watertight[::sampling,2], 
-#             #             c='k', s=1, alpha=0.0)#all_labels_branches[np.squeeze(all_dists)<20], s=1)
 #             ax.scatter(pt_ii_next[::sampling,0], 
-#                        pt_ii_next[::sampling,1],
-#                        pt_ii_next[::sampling,2], c='r',s=1)
 #             # ax.scatter(centroids3D_from_xz[:,0], 
-#             #            centroids3D_from_xz[:,1],
-#             #            centroids3D_from_xz[:,2], c='g',s=10)
 #             # ax.scatter(centroids3D_from_yz[:,0], 
-#             #            centroids3D_from_yz[:,1],
-#             #            centroids3D_from_yz[:,2], c='b',s=10)
 #             # # ax.scatter(skel3D_coords[:,0], 
-#             # #             skel3D_coords[:,1],
-#             # #             skel3D_coords[:,2], c='k',s=5, alpha=1)
-#             # ax.view_init(-90,0)
-#             ax.view_init(0,180)
-#             # ax.view_init(180,0)
-#             # ax.set_xlim([0,binary.shape[0]]) # why is this plot not good? 
-#             # ax.set_ylim([0,binary.shape[1]])
-#             # ax.set_zlim([0,binary.shape[2]])
-#             set_axes_equal(ax)
-#             plt.show(block=False)
         
         
 # # =============================================================================
 # #     To DO: how can we utilise adaptive stopping? e.g. updating just a fraction of the points. ?     
 # # =============================================================================
 #     cell_seg_connected_original, cell_seg_connected, votes_grid_acc = connected_components_pts_3D( pts=pt_ii, 
-#                                                                                                     pts0=pts, 
-#                                                                                                     shape=binary.shape[:3], 
-#                                                                                                     smooth_sigma=smooth_sigma, 
-#                                                                                                     thresh_factor=thresh_factor, 
-#                                                                                                     mask=mask,
-#                                                                                                     min_area=min_area)
     
-#     # return cell_seg_connected_original, cell_seg_connected, tracks, votes_grid_acc
-#     return cell_seg_connected_original, cell_seg_connected, pt_ii, votes_grid_acc
 
 
 
