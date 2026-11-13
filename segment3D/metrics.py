@@ -78,7 +78,6 @@ def metrics_np(y_true, y_pred, metric_name, metric_type='standard', drop_last = 
     
     # define mask to be 0 when no pixels are present in either y_true or y_pred, 1 otherwise
     mask =  np.not_equal(union, 0).astype(np.int32)
-    # mask = 1 - np.equal(union, 0).astype(int) # True = 1
     
     if drop_last:
         metric = metric[:,:-1]
@@ -150,8 +149,6 @@ def _match_cells(labels1, labels2, com1, com2, K=10, bg_label=0):
     # nearest neighbor match on centroids, then bipartite matching on iou !
     nbrs = NearestNeighbors(n_neighbors=K, algorithm='ball_tree').fit(com1)
     _, indices = nbrs.kneighbors(com2)
-#        print(indices.shape)
-#        print(len(com1))
     
     for j in range(len(com2)):
         cand_i = indices[j]
@@ -169,7 +166,6 @@ def _match_cells(labels1, labels2, com1, com2, K=10, bg_label=0):
                 # dice?
                 dice = 2*intersection / float(np.sum(mask1) + np.sum(mask2) + 1e-8)
                 
-#                    print(overlap)
                 sim_matrix[cand_i[i],j] = np.clip(overlap, 0, 1)
                 dice_matrix[cand_i[i],j] = np.clip(dice, 0, 1)
     
@@ -258,13 +254,11 @@ def compute_metrics_cells(labels_true,
     """
     from skimage.measure import label
     from skimage.filters import threshold_otsu
-    # import scipy.ndimage.measurements as scipy_measure
     import scipy.ndimage as ndimage 
     import pylab as plt 
     
     n_images = len(labels_true)
     # based on the overlap we assign and compute the AP based on the segmentations.
-#    if thresh is not None:
     stats = [] # n_GT, n_Pred, n_match, overlap_score. 
     match_props = []
     
@@ -429,7 +423,6 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
     n_pred = np.array(list(map(np.max, masks_pred)))
     
     for n in range(len(masks_true)):
-        #_,mt = np.reshape(np.unique(masks_true[n], return_index=True), masks_pred[n].shape)
         if n_pred[n] > 0:
             iou = _intersection_over_union(masks_true[n], masks_pred[n])[1:, 1:]
             for k,th in enumerate(threshold):
@@ -462,8 +455,6 @@ def _label_overlap(x, y):
     
     """
     # put label arrays into standard form then flatten them 
-#     x = (utils.format_labels(x)).ravel()
-#     y = (utils.format_labels(y)).ravel()
     x = x.ravel()
     y = y.ravel()
     

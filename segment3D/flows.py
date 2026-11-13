@@ -14,33 +14,16 @@ import numpy as np
 """
 Flow 1 - euclidean distance transform. 
 """
-# def distance_transform_labels(labels, bg_label=0):
     
-#     import numpy as np 
-#     from scipy.ndimage import distance_transform_edt
-#     # import skfmm
     
-#     dtform = np.zeros(labels.shape)
-#     dtform_flow = np.zeros((2,)+labels.shape) # keep these separate!. 
     
-#     uniq_labels = np.setdiff1d(np.unique(labels), bg_label)
     
-#     for lab in uniq_labels:
         
-#         mask = labels == lab
-#         # dist_mask = skfmm.distance(mask>0)
-#         # dist_mask = distance_transform_edt(mask>0)
-#         dist_mask = sdf_distance_transform(mask>0)
         
 #         # compute the gradient!. 
-#         grad_dist_mask = np.array(np.gradient(dist_mask))
-#         grad_dist_mask = grad_dist_mask / (np.linalg.norm(grad_dist_mask, axis=0)[None,...] + 1e-20)
         
-#         dtform_flow[:,mask>0] = grad_dist_mask[:,mask>0].copy()
         
-#         dtform[mask>0] = dist_mask[mask>0]
         
-#     return dtform_flow, dtform 
 
 
 # =============================================================================
@@ -171,8 +154,6 @@ def poisson_dist_tform_flow(coords, centroid, shape, power_dist=None, norm_dist=
     poisson = poisson_dist_tform(mask>0, pt=centroid[None,:]) # compute the point source distance transform 
     poisson = ndimage.gaussian_filter(poisson, sigma=1)
 
-    # if log_dist:
-        # poisson = np.log(poisson+1.)
     if power_dist is not None:
         # why are we getting nan? wiht power boost? 
         # this is to boost beyond the numerical limits. 
@@ -201,13 +182,10 @@ def poisson_dist_tform_flow_sets(coords, pts, shape, power_dist=None):
     poisson = poisson_dist_tform(mask>0, pt=pts) # compute the point source distance transform 
     poisson = ndimage.gaussian_filter(poisson, sigma=1) # i smooth? O.O
 
-    # if log_dist:
-        # poisson = np.log(poisson+1.)
     if power_dist is not None:
         # why are we getting nan? wiht power boost? 
         # this is to boost beyond the numerical limits. 
         poisson = (poisson-poisson.min())
-        # poisson = np.clip(poisson, 0, 1)
         poisson = poisson**power_dist # valid for 0-1
         
     poisson_flow = np.array(np.gradient(poisson))
@@ -222,39 +200,17 @@ def poisson_dist_tform_flow_sets(coords, pts, shape, power_dist=None):
 # =============================================================================
 #   Defining the fmm geodesic flow
 # =============================================================================
-# def fmm_point_source2D(binary, pt):
 #     """
 #     This is a much better solver of the diffusion
 #     """
     
-#     import skfmm
-#     import numpy as np
-#     import skimage.morphology as skmorph
-#     import scipy.ndimage as ndimage 
     
 #     # create a masked array
-#     # mask = np.logical_not(skmorph.binary_dilation(binary, skmorph.disk(1)))
-#     mask = np.logical_not(binary).copy()
-#     # mask2 = np.logical_not(skmorph.binary_dilation(binary, skmorph.disk(1)))
-#     mask2 = mask.copy()
-#     m = np.ones_like(binary)
-#     m[pt[0],pt[1]] = 0
-#     m = np.ma.masked_array(m, mask2)
 
-#     dist_image = skfmm.distance(m)  # this is the answer!!!     
-#     dist_image = dist_image.max()-dist_image # invert the image!. # many ways to do this. 
     
 #     # fix up the boundary differentiation. 
-#     dist_outer = (skfmm.distance(mask)*-1) # can we make it smoother? # best
-#     dist_image[mask>0] = dist_outer[mask>0] # this seems to work! (it gives a little normal push. ) 
-#     # dist_image = dist_image/dist_image.max() # retain this. 
     
-#     dist_gradient = np.array(np.gradient(dist_image))
-#     # dist_gradient = dist_gradient/(np.linalg.norm(dist_gradient, axis=0)[None,...]+1e-20) # normalise. 
-#     dist_gradient[:,mask>0] = 0
-#     dist_image[mask>0]=0
     
-#     return dist_image, dist_gradient
 
 def fmm_point_source2D(coords, centroid, shape):
     """
@@ -272,7 +228,6 @@ def fmm_point_source2D(coords, centroid, shape):
     
     # construct the masked out region!. 
     mask = np.logical_not(binary).copy()
-    # mask2 = np.logical_not(skmorph.binary_dilation(binary, skmorph.disk(1)))
     mask2 = mask.copy()
     m = np.ones_like(binary)
     m[centroid[0],centroid[1]] = 0 # define the point source!. 
@@ -284,7 +239,6 @@ def fmm_point_source2D(coords, centroid, shape):
     # fix up the boundary differentiation. 
     dist_outer = (skfmm.distance(mask)*-1) # can we make it smoother? # best
     dist_image[mask>0] = dist_outer[mask>0] # this seems to work! (it gives a little normal push. ) 
-    # dist_image = dist_image/dist_image.max() # retain this. 
     
     dist_gradient = np.array(np.gradient(dist_image))
     
@@ -340,7 +294,6 @@ def fmm_point_source2D_sets(coords, source_pts, shape):
     
     # construct the masked out region!. 
     mask = np.logical_not(binary).copy()
-    # mask2 = np.logical_not(skmorph.binary_dilation(binary, skmorph.disk(1)))
     mask2 = mask.copy()
     m = np.ones_like(binary)
     m[source_pts[:,0],source_pts[:,1]] = 0 # define the set source!. # this is not just a single point. 
@@ -348,18 +301,15 @@ def fmm_point_source2D_sets(coords, source_pts, shape):
 
     dist_image = skfmm.distance(m)  # this is the answer!!!     
     dist_image = dist_image.max()-dist_image # invert the image!. # many ways to do this. 
-    # max_image = dist_image.max()
     
     # fix up the boundary differentiation. 
     dist_outer = (skfmm.distance(mask)*-1) # can we make it smoother? # best
     dist_image[mask>0] = dist_outer[mask>0] # this seems to work! (it gives a little normal push. ) 
-    # dist_image = dist_image/dist_image.max() # retain this. 
     
     
     """
     normalize the distance !
     """
-    # dist_image = dist_image/np.abs(max_image)
     
     dist_gradient = np.array(np.gradient(dist_image))
     dist_gradient[:,source_pts[:,0], source_pts[:,1]] = 0 # enforce to be zero !
@@ -450,7 +400,6 @@ def distance_tform_labels2D(labelled, dtform_fnc, clip=False):
     import numpy as np 
     
     distance = np.zeros(labelled.shape, dtype=np.float32)
-    # distance = np.zeros(labelled.shape)
     binary = labelled>0
     
     labelled_regions = skmeasure.regionprops(labelled)
@@ -494,11 +443,9 @@ def distance_centroid_tform_flow_labels2D(labelled,
     import skimage.morphology as skmorph
     import numpy as np 
     import scipy.ndimage as ndimage
-    # import skimage.filters as skfilters
 
     distance = np.zeros(labelled.shape)
     flow = np.zeros((2,)+labelled.shape)
-    # binary = labelled>0 # to tell us which is not background 
     
     labelled_regions = skmeasure.regionprops(labelled)
     
@@ -523,28 +470,19 @@ def distance_centroid_tform_flow_labels2D(labelled,
             if dtform_method == 'fmm_skel' or dtform_method == 'cellpose_skel':
     
                 # we compute the skeleton. 
-                # print('computing skel')
                 # # replicate the local binary mask 
-                # patch_mask = np.zeros((y2-y1+1, x2-x1+1), dtype=bool)
-                # patch_mask[coords[:,0]-start[0], coords[:,1]-start[1]] = 1
-                # patch_mask = skmorph.binary_erosion(inner, skmorph.square(1)).copy() # compute on the inner!. 
                 patch_mask = inner.copy()
                 # smooth and rebinarize... 
                 
                 if smooth_skel_sigma > 0: 
                     patch_mask = ndimage.gaussian_filter(patch_mask*255., sigma=smooth_skel_sigma) # remove curvature... 
-                    # print(patch_mask.min(), patch_mask.max())
                     patch_mask = patch_mask/(patch_mask.max()+1e-12)> 0.5
-                    # patch_mask = skmorph.binary_erosion(patch_mask, skmorph.disk(1)).copy() # compute on the inner!. 
                     skel = skmorph.skeletonize(patch_mask)
                     skel_base = skel.copy()
                     # smooth and reskel
                     skel = ndimage.gaussian_filter(skel*255., sigma=smooth_skel_sigma)
                     skel = skel/(skel.max()+1e-12) 
-                    # print('computing skel:, ', np.mean(skel))
                     skel = skel > np.mean(skel)
-                    # skel = skel > np.median(skel)
-                    # skel = skel > skfilters.threshold_otsu(skel)
                     try:
                         skel = _largest_component_vol(skel)
                         skel = skmorph.skeletonize(skel) # this is 1 line absolutely constrained. 
@@ -564,7 +502,6 @@ def distance_centroid_tform_flow_labels2D(labelled,
                 # # use this to find an internal fixed point. 
                 coords_guide = guide_img[inner_coords[:,0],inner_coords[:,1]].copy()
                 coords_valid = inner_coords[coords_guide>=np.percentile(coords_guide, fixed_point_percentile*100)]
-                # coords_valid = np.argwhere(skeletonize(patch>0)>0)+start[None,:]
                 centroid = coords_valid[np.argmin(np.linalg.norm(coords_valid-centroid[None,:], axis=1))]
             else:
                 centroid = inner_coords[np.argmin(np.linalg.norm(inner_coords-centroid[None,:], axis=1))]
@@ -592,7 +529,6 @@ def distance_centroid_tform_flow_labels2D(labelled,
                 
                 
             if dtform_method == 'fmm_skel':
-                # print(np.sum(skel>0))
                 if np.sum(skel>0) >0:    
                     dist_, flow_ = fmm_point_source2D_sets(coords-start[None,:]+1, # remove the global offset. 
                                                            np.argwhere(skel>0)+1,
@@ -603,7 +539,6 @@ def distance_centroid_tform_flow_labels2D(labelled,
             if dtform_method == 'cellpose_skel':
                 
                 if np.sum(skel>0) >0:    
-                    # skel = skmorph.binary_dilation(skel,skmorph.disk(1))  # expand. 
                     dist_, flow_ = poisson_dist_tform_flow_sets(coords-start[None,:]+1, # remove the global offset. 
                                                                 np.argwhere(skel>0)+1,
                                                                 shape=np.hstack(patch.shape)+1,
@@ -611,7 +546,6 @@ def distance_centroid_tform_flow_labels2D(labelled,
                 else:
                     dist_ = np.zeros(len(coords))
                     flow_ = np.zeros((2,len(coords)))
-            # diffuse_out = out.reshape(ly+2,lx+2, order='')
             distance[coords[:,0],coords[:,1]] = dist_.copy()
             flow[:,coords[:,0],coords[:,1]] = flow_.copy()
         
@@ -662,7 +596,6 @@ def distance_centroid_tform_flow_labels2D_parallel(labelled_array,
                                                     n_processes=4,
                                                     smooth_skel_sigma=3,
                                                     power_dist=None):
-    # import multiprocessing as mp
     import multiprocess as mp
     import numpy as np 
     
@@ -684,21 +617,14 @@ def distance_centroid_tform_flow_labels2D_parallel(labelled_array,
     with mp.Pool(processes=n_proc) as pool:
         # starts the sub-processes without blocking
         # pass the chunk to each worker process
-        # proc_results = [pool.apply_async(centroid_geodesic_distance_transform2D_chunk,
         #                                     args=(chunk,))
-        #                                   for chunk in chunks]
         
         proc_results = [pool.apply_async(_distance_centroid_tform_flow_labels2D_chunk,
                                             args=(chunk, dtform_method, guide_image,fixed_point_percentile, iter_factor,smooth_skel_sigma, power_dist))
                                           for chunk in chunks]
-        # if dtform_method == 'cellpose_improve':
-        #     proc_results = [pool.apply_async(_distance_centroid_tform_flow_labels2D_chunk,
         #                                         args=(chunk, dtform_method, guide_image,fixed_point_percentile, smooth_skel_sigma, power_dist))
-        #                                       for chunk in chunks]
         # else:
-        #     proc_results = [pool.apply_async(_distance_centroid_tform_flow_labels2D_chunk,
         #                                        args=(chunk, dtform_method, guide_image,fixed_point_percentile, iter_factor))
-        #                                      for chunk in chunks]
          
         # blocks until all results are fetched
         res = np.vstack([r.get() for r in proc_results])
@@ -714,16 +640,12 @@ def distance_centroid_tform_flow_labels2D_dask(labelled_array,
                                                     n_processes=4,
                                                     smooth_skel_sigma=3,
                                                     power_dist=None):
-    # import multiprocessing as mp
     import numpy as np 
     import dask
     from dask.distributed import Client
     
     n_proc = n_processes
     client = Client(n_workers=n_proc, threads_per_worker=1)
-    # client = Client(n_workers=n_proc)
-    # client = Client(n_workers=n_proc, threads_per_worker=1) # enforce single thread, this reduces garbage collection
-    # client = Client(processes=False) # since we are just doing numpy
     
     lazy_flow = dask.delayed(distance_centroid_tform_flow_labels2D)
     
@@ -892,7 +814,6 @@ def remove_bad_flow_masks_2D(mask,
         mask_regionprops = skmeasure.regionprops(mask) # use this. 
         
         for lab in reg_error_labels: # so this need to be faster. but how ? 
-            # mask_new[mask==lab] = 0
             coords = mask_regionprops[lab-1].coords
             mask_new[coords[:,0],
                      coords[:,1]] = 0
@@ -926,22 +847,9 @@ def remove_bad_flow_masks_3D(mask,
         print('ERROR: input ref flow is not same size as predicted masks')
         return
     # # maybe don't need? # remove this!. 
-    # label_xy = _relabel_slices(mask)
-    # label_xz = _relabel_slices(mask.transpose(1,0,2))
-    # label_yz = _relabel_slices(mask.transpose(2,0,1))
 
-    # label_xy = mask.copy()
-    # label_xz = mask.transpose(1,0,2)
-    # label_yz = mask.transpose(2,0,1)
     
-    # import pylab as plt 
-    # plt.figure()
-    # plt.imshow(label_xy[100])
-    # plt.show(block=False)
     
-    # plt.figure()
-    # plt.imshow(label_xz[label_xz.shape[0]//2])
-    # plt.show(block=False)
 
     if dtform_method=='cellpose':
         print('ERROR: not yet implemented.')
@@ -950,16 +858,9 @@ def remove_bad_flow_masks_3D(mask,
         print('starting xy')
         label_xy = mask.copy()
         guide_image_xy = distance_transform_labels_fast(label_xy)
-        # mask_xy_gradient = distance_centroid_tform_flow_labels2D_parallel(label_xy, 
-        #                                                                           dtform_method=dtform_method,
-        #                                                                           guide_image=guide_image_xy,
-        #                                                                           fixed_point_percentile=fixed_point_percentile, 
-        #                                                                           n_processes=n_processes,
-        #                                                                           power_dist=power_dist)
         mask_xy_gradient = distance_centroid_tform_flow_labels2D_dask(label_xy, 
                                                                         dtform_method=dtform_method,
                                                                         guide_image=guide_image_xy,
-                                                                        # guide_image = None,
                                                                         fixed_point_percentile=fixed_point_percentile, 
                                                                         n_processes=n_processes,
                                                                         smooth_skel_sigma=smooth_skel_sigma,
@@ -974,16 +875,9 @@ def remove_bad_flow_masks_3D(mask,
         
         label_xz = mask.transpose(1,0,2)
         guide_image_xz = distance_transform_labels_fast(label_xz)
-        # mask_xz_gradient = distance_centroid_tform_flow_labels2D_parallel(label_xz, 
-        #                                                                         dtform_method=dtform_method,
-        #                                                                           guide_image=guide_image_xz,
-        #                                                                           fixed_point_percentile=fixed_point_percentile, 
-        #                                                                           n_processes=n_processes,
-        #                                                                           power_dist=power_dist)
         mask_xz_gradient = distance_centroid_tform_flow_labels2D_dask(label_xz, 
                                                                         dtform_method=dtform_method,
                                                                            guide_image=guide_image_xz,
-                                                                          # guide_image = None, 
                                                                           fixed_point_percentile=fixed_point_percentile, 
                                                                           n_processes=n_processes,
                                                                           smooth_skel_sigma=smooth_skel_sigma,
@@ -998,16 +892,9 @@ def remove_bad_flow_masks_3D(mask,
         
         label_yz = mask.transpose(2,0,1)
         guide_image_yz = distance_transform_labels_fast(label_yz)
-        # mask_yz_gradient = distance_centroid_tform_flow_labels2D_parallel(label_yz, 
-        #                                                                         dtform_method=dtform_method,
-        #                                                                           guide_image=guide_image_yz,
-        #                                                                           fixed_point_percentile=fixed_point_percentile, 
-        #                                                                           n_processes=n_processes,
-        #                                                                           power_dist=power_dist)
         mask_yz_gradient = distance_centroid_tform_flow_labels2D_dask(label_yz, 
                                                                         dtform_method=dtform_method,
                                                                            guide_image=guide_image_yz,
-                                                                          # guide_image = None,
                                                                           fixed_point_percentile=fixed_point_percentile, 
                                                                           n_processes=n_processes,
                                                                           smooth_skel_sigma=smooth_skel_sigma,
@@ -1077,7 +964,6 @@ def remove_bad_flow_masks_3D(mask,
         valid_labels = np.setdiff1d(np.unique(mask), 0)
         reg_error_labels = np.arange(1, mask.max()+1)[error_labels] # these are the labels to remove!. 
         
-        # print('intersecting...')
         reg_error_labels = np.intersect1d(reg_error_labels, valid_labels) # these must be in the intersection. 
         # ok ... this is still erroring because we have to be able to mtach the index. 
         
@@ -1089,13 +975,8 @@ def remove_bad_flow_masks_3D(mask,
         mask_new = mask.copy()
         mask_regionprops = skmeasure.regionprops(mask) # use this. -- # the problem here is this skips.
         
-        # print(len(mask_regionprops))
-        # print(reg_error_labels)
                 
-        # for lab in reg_error_labels: # so this need to be faster. but how ?
         for lab in reg_error_labels_indices:
-            # # mask_new[mask==lab] = 0
-            # coords = mask_regionprops[lab-1].coords # was lab-1  # this is wrong? --- i don't have as many of these. 
             coords = mask_regionprops[lab].coords
             mask_new[coords[:,0],
                      coords[:,1],
@@ -1207,7 +1088,6 @@ def remove_bad_flow_masks_3D_edt_from2D(mask,
         mask_regionprops = skmeasure.regionprops(mask) # use this. 
         
         for lab in reg_error_labels: # so this need to be faster. but how ? 
-            # mask_new[mask==lab] = 0
             coords = mask_regionprops[lab-1].coords
             mask_new[coords[:,0],
                      coords[:,1],
@@ -1253,7 +1133,6 @@ def remove_bad_flow_masks_3D_edt(mask,
         labels_gradients = np.array(np.gradient(edt_3D))
         
         # # do a little filtering. 
-        # labels_gradients = labels_gradients.transpose(1,0,2,3)
         labels_gradients = labels_gradients / (np.linalg.norm(labels_gradients, axis=0)[None,...] + 1e-20) # do a renormalize!. 
 
 
@@ -1276,7 +1155,6 @@ def remove_bad_flow_masks_3D_edt(mask,
         mask_regionprops = skmeasure.regionprops(mask) # use this. 
         
         for lab in reg_error_labels: # so this need to be faster. but how ? 
-            # mask_new[mask==lab] = 0
             coords = mask_regionprops[lab-1].coords
             mask_new[coords[:,0],
                      coords[:,1],
@@ -1321,7 +1199,6 @@ def remove_bad_flow_masks_3D_mp(mask,
         
         # define this internal function for multiprocessing pool to operate on 
         def _compute_cellflow_view(slice_id):
-            # out = grad_flows.distance_centroid_tform_flow_labels2D()
             out = distance_centroid_tform_flow_labels2D(tmp[slice_id], 
                                                         dtform_method=dtform_method, 
                                                         guide_img=guide[slice_id], 
@@ -1414,7 +1291,6 @@ def remove_bad_flow_masks_3D_mp(mask,
         mask_regionprops = skmeasure.regionprops(mask) # use this. 
         
         for lab in reg_error_labels: # so this need to be faster. but how ? 
-            # mask_new[mask==lab] = 0
             coords = mask_regionprops[lab-1].coords
             mask_new[coords[:,0],
                      coords[:,1],

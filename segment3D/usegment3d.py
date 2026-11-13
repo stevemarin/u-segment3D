@@ -55,7 +55,6 @@ def preprocess_imgs(img, params):
             imgs_out = np.array([usegment3D_gpu.zoom_3d_pytorch(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom) for ch in np.arange(len(imgs_out))], dtype=np.float32)
         except Exception as e:
             print('no gpu. falling back to CPU for resizing', '| error:', repr(e))
-            # imgs_out = np.array([ndimage.zoom(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom, order=1, mode='reflect') for ch in np.arange(len(imgs_out))], dtype=np.float32)
             imgs_out = np.array([usegment3D_gpu.dask_cpu_rescale(usegment3D_filters.fill_array(imgs_out[ch], method='median'), zoom, order=1, mode='reflect') for ch in np.arange(len(imgs_out))], dtype=np.float32)
 
     # 2. background correct illumination 
@@ -69,8 +68,6 @@ def preprocess_imgs(img, params):
         try:
             # gpu.bg_normalize uses cucim which somehow needs module load cuda. # so does cupy give this error hm... 
             imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.bg_normalize(ch_im, bg_ds=bg_ds, bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
-            # imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.dask_cuda_bg(ch_im, 
-            #                                                                               bg_ds=bg_ds, 
             #                                                                               bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
         except Exception as e:
             try:
@@ -83,8 +80,6 @@ def preprocess_imgs(img, params):
         try:
             # gpu.bg_normalize uses cucim which somehow needs module load cuda. # so does cupy give this error hm... 
             imgs_out = np.array([usegment3D_gpu.num_normalize(ch_im, pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
-            # imgs_out = np.array([usegment3D_gpu.num_normalize(usegment3D_gpu.dask_cuda_bg(ch_im, 
-            #                                                                               bg_ds=bg_ds, 
             #                                                                               bg_sigma=bg_sigma), pmin=bg_normalize_min, pmax=bg_normalize_max, clip=True) for ch_im in imgs_out])
         except Exception as e:
             print('no gpu. falling back to CPU for normalizing', '| error:', repr(e))
@@ -594,7 +589,6 @@ def aggregate_2D_to_3D_segmentation_indirect_method(segmentations,
                 gradient = usegment3D_flows.distance_centroid_tform_flow_labels2D_dask(mask*1, 
                                                                                         dtform_method=params['indirect_method']['dtform_method'],
                                                                                         guide_image=skel_guide_image,
-                                                                                        # guide_image = None, # this is not currently used. 
                                                                                         fixed_point_percentile=params['indirect_method']['edt_fixed_point_percentile'], 
                                                                                         n_processes=n_processes,
                                                                                         iter_factor =  params['indirect_method']['iter_factor'], 
@@ -796,7 +790,6 @@ def postprocess_3D_cell_segmentation(segmentation,
         
         if np.sum(areas>area_thresh): # there are regions greater than this threshold 
             remove_labels_indices = np.arange(len(uniq_labels))[areas>area_thresh]
-            # remove_labels = uniq_labels[remove_labels_indices]
             
             for rr in remove_labels_indices:
                 coords = regions[rr].coords
@@ -814,7 +807,6 @@ def postprocess_3D_cell_segmentation(segmentation,
         
         # do the multiprocess. 
         import multiprocess as mp # this version allows pickling. 
-        # import multiprocessing as mp
         
         dtform_method = params['flow_consistency']['dtform_method']
         n_cpu = params['flow_consistency']['n_cpu']
@@ -830,7 +822,6 @@ def postprocess_3D_cell_segmentation(segmentation,
             guide = usegment3D_flows.distance_transform_labels_fast(tmp, n_threads=n_cpu)
             
             def _compute_cellflow_view(slice_id): # can't really pickle this. 
-                # out = grad_flows.distance_centroid_tform_flow_labels2D()
                 
                 if dtform_method == 'edt':
                     # this is just the guide
@@ -852,8 +843,6 @@ def postprocess_3D_cell_segmentation(segmentation,
             print('start xy')
             # do xy first. 
             with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool: 
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
                 gradient_xy = pool.map(_compute_cellflow_view, range(0, len(tmp)))
                 gradient_xy = np.array(gradient_xy, dtype=np.float32) #.transpose(1,0,2,3)
                 gradient_xy = gradient_xy[:,1:]
@@ -867,8 +856,6 @@ def postprocess_3D_cell_segmentation(segmentation,
             
             print('start xz')
             with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool: 
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
                 gradient_xz = pool.map(_compute_cellflow_view, range(0, len(tmp)))
                 gradient_xz = np.array(gradient_xz,dtype=np.float32)#.transpose(1,0,2,3)
                 gradient_xz = gradient_xz[:,1:].copy()
@@ -883,8 +870,6 @@ def postprocess_3D_cell_segmentation(segmentation,
             
             print('start yz')
             with mp.Pool(n_cpu) as pool:
-            # with ThreadPool(mp.cpu_count()-1) as pool:
-                # res = pool.map(compute_cellflow_view_xz, range(0, len(labels_3D_watershed_filt.transpose(1,0,2))))
                 gradient_yz = pool.map(_compute_cellflow_view, range(0, len(tmp)))
                 gradient_yz = np.array(gradient_yz,dtype=np.float32)#.transpose(1,0,2,3)
                 gradient_yz = gradient_yz[:,1:] ; gradient_yz = gradient_yz.transpose(2,1,3,0) 
@@ -984,7 +969,6 @@ def postprocess_3D_cell_segmentation(segmentation,
             mask_regionprops = skmeasure.regionprops(segmentation_filt) # use this. 
             
             for lab in reg_error_labels_indices: # so this need to be faster. but how ? 
-                # mask_new[mask==lab] = 0
                 coords = mask_regionprops[lab].coords
                 mask_new[coords[:,0],
                          coords[:,1],
@@ -997,21 +981,9 @@ def postprocess_3D_cell_segmentation(segmentation,
             
             # # check also the below: which might be easier to call. # wwe should use this method. 
             # segmentation_filt, flow_errors, ref_cell_gradients = grad_flows.remove_bad_flow_masks_3D(segmentation_filt, 
-            #                                                                              cell_gradients.transpose(3,0,1,2),
-            #                                                                              flow_threshold=flow_threshold, # get rid of only the very worst ones! 
-            #                                                                              n_processes=mp.cpu_count-1) # set a generous threshold.
             
             # remove_bad_flow_masks_3D(mask, 
             #                  flow, 
-            #                  flow_threshold=0.6,
-            #                  dtform_method='cellpose_improve',  
-            #                  fixed_point_percentile=0.01, 
-            #                  n_processes=4,
-            #                  power_dist=None,
-            #                  alpha=0.5, 
-            #                  smooth_sigma=0,
-            #                  smooth_ds=1,
-            #                  filter_scale = 1)
     """
     3. statistical size filter
     """
@@ -1026,7 +998,6 @@ def postprocess_3D_cell_segmentation(segmentation,
         
         if np.sum(areas>area_thresh):
             remove_labels_indices = np.arange(len(uniq_labels))[areas>area_thresh]
-            # remove_labels = uniq_labels[remove_labels_indices]
             
             for rr in remove_labels_indices:
                 coords = regions[rr].coords
@@ -1076,14 +1047,11 @@ def label_diffuse_3D_cell_segmentation_MP(segmentation,
     
     segmentation_pad = np.pad(segmentation, padding, mode='constant')*1 # maybe this will be fine!
     
-    # print(guide_img_pad.shape, segmentation_pad.shape)
-    # print(segmentation_pad.max())
     
     # find out the individual cell ids
     cells = skmeasure.regionprops(segmentation_pad)
     cells_id = np.setdiff1d(np.unique(segmentation_pad), 0 ) # exclude the background label
     
-    # print(len(cells))
     bboxes = [cells[ii].bbox for ii in range(0, len(cells))]
     
     """
@@ -1091,8 +1059,6 @@ def label_diffuse_3D_cell_segmentation_MP(segmentation,
     """
     def _refine_single_obj(obj_id):
         
-        # bbox = cells[obj_id].bbox
-        # area = cells[obj_id].area
         bbox = bboxes[obj_id]
         
         label_bbox = segmentation_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
@@ -1102,14 +1068,6 @@ def label_diffuse_3D_cell_segmentation_MP(segmentation,
                                   bbox[1]-pad[1]:bbox[4]+pad[1],
                                   bbox[2]-pad[2]:bbox[5]+pad[2]]
         
-        # if multilabel_refine:
-        #     label_bbox_refine = usegment3D_filters.diffuse_labels3D(label_bbox*1, 
-        #                                                                 label_img, clamp=refine_clamp,
-        #                                                                 n_iter=refine_iters, # was 25
-        #                                                                 alpha=refine_alpha, # was 0.25
-        #                                                                 noprogress=noprogress_bool,
-        #                                                                 affinity_type=affinity_type)
-        #     label_coords = np.argwhere(label_bbox_refine==cells_id[obj_id]) # has to be the same id. 
         # else:
         label_bbox_refine = usegment3D_filters.diffuse_labels3D((label_bbox==cells_id[obj_id])*1, 
                                                                     label_img, clamp=refine_clamp,
@@ -1125,7 +1083,6 @@ def label_diffuse_3D_cell_segmentation_MP(segmentation,
             label_coords = [] # empty 
       
         # suppress printing. 
-        # print(obj_id)
         return label_coords
     
     """
@@ -1133,11 +1090,7 @@ def label_diffuse_3D_cell_segmentation_MP(segmentation,
     """
     
     with mp.Pool(n_cpu) as pool: # potentially thread is faster? 
-    #     with mp.Pool(n_procs-1) as pool:
-    # # with ThreadPool(n_procs) as pool: #586 with multiprocess but dask then does work. 
         res = pool.map(_refine_single_obj, range(0, len(cells)))
-        # res = np.concatenate(res, 1) # collapse all. 
-        # res = res - offset[None,None,:] # subtract the global padding.... everything else shud be fine!. 
     # remove the offset with broadcasting.
     
     """
@@ -1250,8 +1203,6 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
     """
     def _refine_single_obj_guidedfilter(obj_id):
         
-        # bbox = cells[obj_id].bbox
-        # area = cells[obj_id].area
         bbox = bboxes[obj_id]
         
         label_bbox = segmentation_pad[bbox[0]-pad[0]:bbox[3]+pad[0],
@@ -1264,7 +1215,6 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
 
         # figure out the mean size. (used if adaptive)        
         mean_size = np.prod(label_bbox.shape)**(1./3) # this seems better. 
-        # mean_size = (np.sum((label_bbox==cells_id[obj_id])) * 3/ 4. /(np.pi))**(1./3)
         
         label_binary = label_bbox == cells_id[obj_id]
         
@@ -1279,7 +1229,6 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
                                                               label_img, 
                                                                radius=np.maximum(min_protrusion_size, mean_size*size_factor),
                                                               eps=guide_filter_eps)
-        # print(np.max(label_img))
         else:
             label_bbox_refine_guided = usegment3D_filters.guidedfilter(label_binary, 
                                                               label_img, 
@@ -1308,11 +1257,8 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
         if params['guide_filter']['collision_erode']>0:
             # # mask with others. # so we don't go over... 
             label_bbox_refine = np.logical_or((label_bbox==cells_id[obj_id]), 
-                                              # label_bbox == 0)
                                               skmorph.binary_erosion(label_bbox == 0, skmorph.ball(params['guide_filter']['collision_erode']))) * label_bbox_refine
-            # label_bbox_refine = np.logical_or((label_bbox==cells_id[obj_id]), 
             #                                   label_bbox == 0) * label_bbox_refine
-            # label_bbox_refine = grad_filters.largest_component_vol(label_bbox_refine) # takes the largest comp
             
         if params['guide_filter']['collision_close']>0:
             label_bbox_refine = skmorph.binary_closing(label_bbox_refine, skmorph.ball(params['guide_filter']['collision_close'])) # generally ok.
@@ -1328,16 +1274,12 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
         if len(label_coords)>0:
             label_coords = label_coords + (bbox[:3]-pad[:3])[None,:] ### this should be correct.... 
         
-        # # return old_binary, new_binary, label_coords # just the coords will be good. 
-        # print(obj_id)
         return label_coords
     """
     execute the multiprocess
     """
     
     with mp.Pool(n_cpu) as pool: # potentially thread is faster? 
-    #     with mp.Pool(n_procs-1) as pool:
-    # # with ThreadPool(n_procs) as pool: #586 with multiprocess but dask then does work. 
         res = pool.map(_refine_single_obj_guidedfilter, range(0, len(cells)))
         
     """
@@ -1362,7 +1304,6 @@ def guided_filter_3D_cell_segmentation_MP(segmentation,
     
 
 # this is the multilabel diffusion equivalent for a single binary  ? (is this worth it?)
-# def enhance_3D_binary_segmentation():
     
     
     

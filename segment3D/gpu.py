@@ -75,7 +75,6 @@ def zoom_3d_pytorch(image_np, zoom_factors,interp_mode='trilinear', output_size=
             zoomed_image = F.interpolate(
                 image.unsqueeze(0),  # Add a batch dimension
                 size=tuple(output_size), # must be tuple
-                # scale_factor=zoom_factors,
                 mode=interp_mode,  # Use trilinear interpolation for 3D images
                 align_corners=False  # For better accuracy (if you have the option)
             ).squeeze(0)  # Remove the batch dimension
@@ -84,7 +83,6 @@ def zoom_3d_pytorch(image_np, zoom_factors,interp_mode='trilinear', output_size=
             zoomed_image = F.interpolate(
                 image.unsqueeze(0),  # Add a batch dimension
                 size=tuple(output_size), # must be tuple
-                # scale_factor=zoom_factors,
                 mode=interp_mode,  # Use trilinear interpolation for 3D images
             ).squeeze(0)  # Remove the batch dimension
 
@@ -165,7 +163,6 @@ def dask_cuda_bg(img, bg_ds=8, bg_sigma=5, chunksize=(512,512,512)):
     import dask.array as da
     import scipy.ndimage as ndimage 
     _init_cupy() # in the main thread, before dask runs cuda_rescale in worker threads
-    # import cucim.skimage.transform as cu_transform # seems to not need this and this seems experimental / temperamental. 
 
     im_chunk = da.from_array(img, chunks=chunksize) # make into chunk -> we can then map operation?  
     g = im_chunk.map_blocks(cuda_rescale, zoom=[1./bg_ds]*len(img.shape), order=1, mode='reflect', dtype=np.float32)
@@ -194,7 +191,6 @@ def cuda_smooth_vol( im, ds=4, sigma=5):
     
     _load_torch_cuda_libs() # make cupy independent of torch/cupy import order
     import cupyx.scipy.ndimage as ndimage
-    # import cucim.skimage.transform as cu_transform
     import numpy as np
     import cupy
     
@@ -223,7 +219,6 @@ def cuda_normalize(x, pmin=2, pmax=99.8, axis=None,  clip=False, eps=1e-20, cast
         return out
         
     
-# import dask.array as da
 from numba import jit
 @jit(nopython=True, parallel=True)
 def _num_bg_correct_elementwise(im, bg, m, eps):
@@ -238,7 +233,6 @@ def num_bg_correct(im, bg, eps=0.1):
 @jit(nopython=True, nogil=True, parallel=True)
 def num_normalize(a, pmin=2, pmax=99.8, clip=True, eps=1e-20):
     
-    # mi = np.percentile(a, pmin)
     mi, ma = np.percentile(a, [pmin, pmax])
     a = (a-mi)/(ma-mi+eps)
     if clip:
@@ -247,19 +241,9 @@ def num_normalize(a, pmin=2, pmax=99.8, clip=True, eps=1e-20):
     
 
 # @jit(nopython=True, nogil=True, parallel=True)
-# def fill_array(im, thresh=0, fill_vals=0, method='constant'):
     
-#     import numpy as np 
-#     out = im.copy()
     
-#     if method == 'constant':
-#         out[im<=thresh] = fill_vals
-#     if method == 'median':
-#         out[im<=thresh] = np.nanmedian(im[im>thresh])
-#     if method == 'mean':
-#         out[im<=thresh] = np.nanmean(im[im>thresh])
         
-#     return out
 
 def bg_normalize(im, bg_ds=8, bg_sigma=5):
     

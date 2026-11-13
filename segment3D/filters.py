@@ -113,7 +113,6 @@ def anisodiff(img,niter=1,kappa=50,gamma=0.1,step=(1.,1.),sigma=0, option=1,plot
     July 2012 translated to Python
     """
     
-    # import skimage.filters as flt
     import scipy.ndimage.filters as flt
     import warnings 
     import skimage.io as io
@@ -193,7 +192,6 @@ def anisodiff(img,niter=1,kappa=50,gamma=0.1,step=(1.,1.),sigma=0, option=1,plot
             ih.set_data(imgout)
             ax2.set_title(iterstring)
             fig.canvas.draw()
-            # sleep(0.01)
 
     return imgout
 
@@ -360,37 +358,26 @@ def filter_segmentations_axis(labels, window=3, min_count=1):
             for ii in np.arange(0, 2*offset+1):
                 # now we are going to apply. 
                 if ii != offset:
-                    # print(ii)
                     mask_ii = labels_pad[ss_ii+cnt, mask>0].copy()
                     
-                    # print(np.sum(mask_ii>0))
                     if np.sum(mask_ii>0) >= min_count:
                         checks[cnt] += 1 # append true. 
                     
                     cnt+=1
                 # else:
-                #     checks[cnt] += 1
-                #     cnt+=1
                     
                     
-            # print(checks)
-            # if np.max(checks) < offset: # less than half i.e. not persistent # so this is wrong!. --- what i was going to do is the below. 
             # i think we do need to check continguousness!. 
             
             # check contiguity! 
             contigs = skmeasure.label(checks)
             
-            # print(contigs)
             
             if contigs.max() > 0:
                 uniq_contig = np.setdiff1d(np.unique(contigs), 0)
                 lengths = [np.sum(contigs==cc) for cc in uniq_contig]
                 mask = contigs == uniq_contig[np.argmax(lengths)]
                 
-                # print(mask)
-                # print(contigs)
-                # print(np.sum(mask)>= window //2 + 1)
-                # print('---')
                 
                 # check the length of mask
                 if np.sum(mask)>= window //2 + 1:
@@ -402,8 +389,6 @@ def filter_segmentations_axis(labels, window=3, min_count=1):
                     ss_copy[ss==reg] = 0
             else:
                 ss_copy[ss==reg] = 0 # zero it
-            # if np.sum(checks) < len(checks): 
-            #     ss_copy[ss==reg] = 0 # zero it
                 
         labels_filt.append(ss_copy)
         
@@ -439,7 +424,6 @@ def filter_segmentations_axis_IoU(labels, window=3, iou_var = 0.1):
             for ii in np.arange(0, 2*offset+1):
                 # now we are going to apply. 
                 if ii != offset:
-                    # print(ii)
                     mask_ii = labels_pad[ss_ii+cnt, mask>0].copy()
                     
                     if mask_ii.max()>0:
@@ -453,15 +437,9 @@ def filter_segmentations_axis_IoU(labels, window=3, iou_var = 0.1):
                     else:
                         iou_checks[cnt] = 0 
                     
-                    # # print(np.sum(mask_ii>0)>0)
-                    # if np.sum(mask_ii>0) >= min_count:
-                    #     checks[cnt] += 1 # append true. 
                     cnt+=1
                 # else:
                     
-            # print(checks)
-            # if np.max(checks) < offset: # less than half i.e. not persistent # so this is wrong!. --- what i was going to do is the below. 
-            # print(iou_checks, np.std(iou_checks))
             if np.std(iou_checks) > iou_var: 
                 ss_copy[ss==reg] = 0 # zero it
                 
@@ -495,7 +473,6 @@ def smooth_vol_anisotropic(vol_binary, ds=4, smooth=[5,5,5]):
     import numpy as np 
     
     small = sktform.resize(vol_binary, np.array(vol_binary.shape)//ds, preserve_range=True)
-    # small = gaussian_filter(small, sigma=smooth)
     for axis in np.arange(len(smooth)):
         small = gaussian_filter1d(small, sigma=smooth[axis], axis=axis) # apply separable filtering 
     
@@ -514,7 +491,6 @@ def remove_small_labels(labels, min_size=64):
         props = skmeasure.regionprops(labels)
     
         areas = np.hstack([re.area for re in props])
-        # print(areas)
         regions_remove = uniq_regions[areas<min_size]
         
         labels_new = labels.copy()
@@ -709,8 +685,6 @@ def var_combine(arrays, ksize=3, alpha = 1., eps=1e-20):
 
 def dog_combine(arrays, ksize=3, eps=1e-20):
         
-    # import skimage.filters.rank as skfilters_rank #import entropy 
-    # import skimage.morphology as skmorph
     import numpy as np 
     
     weights = np.array([np.clip(fast_dog_filter(array, ksize=ksize, norm=True), 0, 4) for array in arrays])
@@ -792,11 +766,9 @@ def largest_component_vol_labels_fast(vol_labels, connectivity=1):
     import cc3d
     import numpy as np 
     import skimage.measure as skmeasure
-    # from tqdm import tqdm 
     
     vol_labels_clean = np.zeros_like(vol_labels)
     
-    # region_labels = np.setdiff1d(np.unique(vol_labels), 0)
     regions = skmeasure.regionprops(vol_labels) # supports bbox. 
     print(len(regions))
     
@@ -846,7 +818,6 @@ def _distance_to_heat_affinity_matrix(Dmatrix, gamma=None):
 
     """
     import numpy as np 
-    # import igl
     import scipy.sparse as spsparse
 
     l = Dmatrix.shape[0]
@@ -884,7 +855,6 @@ def _distance_to_laplace_affinity_matrix(Dmatrix, gamma=None):
 
     """
     import numpy as np 
-    # import igl
     import scipy.sparse as spsparse
 
     l = Dmatrix.shape[0]
@@ -959,38 +929,17 @@ def diffuse_labels2D(labels_in, guide, clamp=0.99, n_iter=10, noprogress=True, a
     labels[np.arange(len(labels_in_relabel.ravel())), labels_in_relabel.ravel()] = 1 # set all the labels 
     
     # # diffuse on this.... with label propagation.
-    # alpha_prop = clamp
-    # base_matrix = (1.-alpha_prop)*labels
     # # above looks wrong... 
-    # alpha_prop = 1.-clamp
-    # base_matrix = (1.-alpha_prop)*labels
     
     init_matrix = np.zeros_like(labels) # let this be the new. 
     
     for ii in tqdm(np.arange(n_iter), disable=noprogress):
-        # init_matrix = affinity.dot(init_matrix) + base_matrix
         init_matrix = (1.-clamp)*affinity.dot(init_matrix) + clamp*labels # this is the correct equation.
         
-        # print(np.mean(init_matrix))
         
         # # at some point this can saturate... 
-        # if reinitialize_freq is not None:
             
-        #     init_matrix = init_matrix / np.nanmean(init_matrix)
-        #     # print('reinitialize_freq')
-        #     # z = np.nansum(init_matrix, axis=1)
-        #     # z[z==0] += 1 # Avoid division by 0
-        #     # z = ((init_matrix.T)/z).T
-        #     # init_matrix = z.copy()
-        #     # # if np.mod(ii+1, reinitialize_freq) == 0:
-        #     # #     z = np.nansum(init_matrix, axis=1) # sum all counts.
-        #     # #     z[z==0] += 1 # Avoid division by 0
-        #     # #     z = ((init_matrix.T)/z).T # renormalize. 
-        #     # #     z_label = np.argmax(z, axis=1)
                 
-        #     # #     init_matrix = np.zeros_like(labels)
-        #     # #     init_matrix[np.arange(len(z_label.ravel())), z_label.ravel()] = 1
-        #     # #     # init_matrix = np.zeros_like(labels)
                 
     z = np.nansum(init_matrix, axis=1)
     z[z==0] += 1 # Avoid division by 0
@@ -1062,38 +1011,19 @@ def diffuse_labels3D(labels_in, guide, clamp=0.99, n_iter=10, noprogress=True, a
     labels[np.arange(len(labels_in_relabel.ravel())), labels_in_relabel.ravel()] = 1 # set all the labels 
     
     # # diffuse on this.... with label propagation.
-    # alpha_prop = clamp
-    # base_matrix = (1.-alpha_prop)*labels
     # # above looks wrong... 
-    # alpha_prop = 1.-clamp
-    # base_matrix = (1.-alpha_prop)*labels
     
     init_matrix = np.zeros_like(labels) # let this be the new. 
     
     for ii in tqdm(np.arange(n_iter), disable=noprogress):
-        # init_matrix = affinity.dot(init_matrix) + base_matrix
         init_matrix = (1.-clamp)*affinity.dot(init_matrix) + clamp*labels # this is the correct equation.
         
-        # print(np.mean(init_matrix))
         
         # at some point this can saturate... 
         if reinitialize_freq is not None:
             
             init_matrix = init_matrix / np.nanmean(init_matrix)
-            # print('reinitialize_freq')
-            # z = np.nansum(init_matrix, axis=1)
-            # z[z==0] += 1 # Avoid division by 0
-            # z = ((init_matrix.T)/z).T
-            # init_matrix = z.copy()
-            # # if np.mod(ii+1, reinitialize_freq) == 0:
-            # #     z = np.nansum(init_matrix, axis=1) # sum all counts.
-            # #     z[z==0] += 1 # Avoid division by 0
-            # #     z = ((init_matrix.T)/z).T # renormalize. 
-            # #     z_label = np.argmax(z, axis=1)
                 
-            # #     init_matrix = np.zeros_like(labels)
-            # #     init_matrix[np.arange(len(z_label.ravel())), z_label.ravel()] = 1
-            # #     # init_matrix = np.zeros_like(labels)
                 
     z = np.nansum(init_matrix, axis=1)
     z[z==0] += 1 # Avoid division by 0

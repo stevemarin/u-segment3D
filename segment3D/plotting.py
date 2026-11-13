@@ -37,7 +37,6 @@ def relabel_ground_truth_labels(mask, connectivity=2, minsize=10, reorder=True):
     import skimage.measure as skmeasure 
     import skimage.morphology as skmorph
     import numpy as np 
-    # import skimage.segmentation as sksegmentation 
     
     # get the labelled regions. 
     uniq_regions = np.setdiff1d(np.unique(mask),0)
@@ -72,7 +71,6 @@ def relabel_ground_truth_labels(mask, connectivity=2, minsize=10, reorder=True):
         for ii, lab in enumerate(ind):
             masks_out_reorder[masks_out==lab+1] = ii + 1
         return masks_out_reorder
-    # masks_out = sksegmentation.relabel_sequential(masks_out)[0]
     else:    
         return masks_out
         
@@ -106,7 +104,6 @@ def get_colors(inp, colormap, vmin=None, vmax=None, bg_label=None):
 def plot_border_tracks_2D(tracks, labels, ax, lw=1, color='magenta', samples=10):
     
     import skimage.segmentation as sksegmentation
-    # import skimage.measure as skmeasure 
     import numpy as np 
     
     
