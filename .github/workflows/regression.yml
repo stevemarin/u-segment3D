@@ -1,0 +1,29 @@
+name: regression
+
+# Checks that a pull request does not change the behavior of segment3D,
+# by comparing it with the branch it targets (see tests/regression/README.md).
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compare-with-base:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy<2.0" scipy scikit-image scikit-learn "dask[array,distributed]" \
+            numba matplotlib seaborn tqdm multiprocess tiler connected-components-3d "edt<=3.0.0" \
+            trimesh opencv-python-headless scikit-fmm tifffile
+
+      - name: Compare with the base branch
+        run: python tests/regression/check.py --ref "origin/${{ github.base_ref || 'master' }}"
